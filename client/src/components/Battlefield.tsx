@@ -1,20 +1,31 @@
 
 import React, { useRef, useEffect, useCallback } from 'react';
-import { 
-  CANVAS_WIDTH, 
-  CANVAS_HEIGHT, 
-  PLAYER_DEFAULTS, 
-  ENEMY_CONFIGS, 
+import {
+  CANVAS_WIDTH,
+  CANVAS_HEIGHT,
+  PLAYER_DEFAULTS,
+  ENEMY_CONFIGS,
   DIFFICULTY_INTERVAL,
   COMBO_TIMEOUT,
   PHYSICS,
-  BOSS_SCORE_THRESHOLD
+  BOSS_SCORE_THRESHOLD,
+  TANK_CLASSES,
+  LASER_RANGE,
+  ULTIMATES,
+  MAX_ENERGY,
+  ENERGY_PER_KILL,
+  ENERGY_CELL_VALUE,
+  ENERGY_DROP_KILLS
 } from '../constants';
-import { 
+import {
   Tank, Bullet, Explosion, Particle, RepairItem,
-  GameState, WeatherType, TerrainType, EnemyType 
+  GameState, WeatherType, TerrainType, EnemyType,
+  type TankClass, type PlayerConfig
 } from '../types';
 import { audioService } from '../services/audioService';
+import { sampleLocalInputs } from '../input/localInput';
+import { EMPTY_INPUT } from '@hypertank/shared';
+import { PixiRenderer } from '../render/PixiRenderer';
 
 interface BomberSequence {
   active: boolean;
@@ -68,17 +79,157 @@ interface SpecializedBullet extends Bullet {
   isPersistent?: boolean;
 }
 
+/**
+ * The render/network seam (Phase 3). The simulation produces this each frame and
+ * the renderer consumes it — the renderer never reaches into the engine's internal
+ * state. `players` is already an array so local-2P / online (Phases 5–7) need no
+ * new shape; `player` is a convenience alias to the local player (players[0]).
+ */
+interface LaserBeam {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  color: string;
+  life: number;
+  maxLife: number;
+  width: number;
+}
+
+interface EnergyCell {
+  id: string;
+  x: number;
+  y: number;
+  radius: number;
+  lifespan: number;
+  opacity: number;
+}
+
+export interface WorldSnapshot {
+  players: Tank[];
+  player: Tank;
+  enemies: Tank[];
+  bullets: SpecializedBullet[];
+  repairItems: RepairItem[];
+  energyCells: EnergyCell[];
+  explosions: Explosion[];
+  particles: Particle[];
+  floatingTexts: FloatingText[];
+  spawnIndicators: SpawnIndicator[];
+  treadMarks: TreadMark[];
+  beams: LaserBeam[];
+  bomber: BomberSequence;
+  weather: WeatherType;
+  terrain: TerrainType;
+  difficulty: number;
+  screenShake: number;
+  screenFlash: number;
+  arena: { w: number; h: number };
+}
+
 interface BattlefieldProps {
   onGameOver: (score: number, maxCombo: number) => void;
   onStateUpdate: (updates: Partial<GameState>) => void;
   difficulty: number;
   status: GameState['status'];
+  graphicsQuality: 'low' | 'medium' | 'high';
+  playerConfigs: PlayerConfig[];
 }
 
-const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, difficulty, status }) => {
+type PlayerEntity = Tank & {
+  lastShot: number;
+  ammo: number;
+  maxAmmo: number;
+  isCooldown: boolean;
+  reloadTimer: number;
+  reloadDuration: number;
+  damage: number;
+  fireRate: number;
+  bulletSpeed: number;
+  weapon: 'projectile' | 'laser';
+  regen: boolean;
+  lastFireTime: number;
+  regenAccumulator: number;
+  tankClass: TankClass;
+  energy: number;
+  maxEnergy: number;
+  ultActiveTimer: number;
+  ultSpin: number;
+};
+
+const PLAYER_COLORS = ['#38bdf8', '#fbbf24', '#22c55e', '#a855f7'];
+
+const DEFAULT_CONFIGS: PlayerConfig[] = [
+  { id: 'player-tank', name: 'Player 1', control: 'wasd', color: '#38bdf8', isLocal: true, tankClass: 'assault' },
+];
+
+/** Build a player tank for a slot, applying its class loadout, spread along the bottom edge. */
+function makePlayer(slot: number, count: number, config: PlayerConfig): PlayerEntity {
+  const cls = TANK_CLASSES[config.tankClass];
+  const spacing = 150;
+  const startX = CANVAS_WIDTH / 2 - ((count - 1) * spacing) / 2 + slot * spacing;
+  return {
+    id: config.id || (slot === 0 ? 'player-tank' : `player-${slot}`),
+    x: startX,
+    y: CANVAS_HEIGHT - 100,
+    width: cls.width,
+    height: cls.height,
+    angle: -Math.PI / 2,
+    turretAngle: -Math.PI / 2,
+    health: cls.health,
+    maxHealth: cls.health,
+    speed: PHYSICS.MAX_SPEED,
+    velocity: { x: 0, y: 0 },
+    color: config.color || PLAYER_COLORS[slot] || '#38bdf8',
+    isShielded: false,
+    shootTimer: 0,
+    shootInterval: cls.fireRate,
+    type: 'player',
+    recoilOffset: 0,
+    lastShot: 0,
+    tankClass: config.tankClass,
+    ammo: cls.maxAmmo,
+    maxAmmo: cls.maxAmmo,
+    isCooldown: false,
+    reloadTimer: 0,
+    reloadDuration: cls.reload,
+    damage: cls.damage,
+    fireRate: cls.fireRate,
+    bulletSpeed: cls.bulletSpeed,
+    weapon: cls.weapon,
+    regen: cls.regen,
+    lastFireTime: 0,
+    regenAccumulator: 0,
+    energy: 0,
+    maxEnergy: MAX_ENERGY,
+    ultActiveTimer: 0,
+    ultSpin: 0,
+  };
+}
+
+/** Nearest living player to a point (enemy AI target). Falls back to slot 0. */
+function nearestPlayer(players: PlayerEntity[], e: { x: number; y: number }): PlayerEntity {
+  let best = players[0];
+  let bd = Infinity;
+  for (const p of players) {
+    if (p.health <= 0) continue;
+    const d = Math.hypot(p.x - e.x, p.y - e.y);
+    if (d < bd) {
+      bd = d;
+      best = p;
+    }
+  }
+  return best;
+}
+
+const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, difficulty, status, graphicsQuality, playerConfigs }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const gameEndedRef = useRef(false);
   const statusRef = useRef(status);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const pixiRef = useRef<PixiRenderer | null>(null);
+  const ctx2dRef = useRef<CanvasRenderingContext2D | null>(null);
+  const activeCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const stateRef = useRef({
     score: 0,
     lastBossScore: 0,
@@ -87,32 +238,15 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     lastComboTime: 0,
     difficulty: 1,
     killCount: 0,
-    ammo: PLAYER_DEFAULTS.maxAmmo,
-    isCooldown: false,
     screenShake: 0,
     screenFlash: 0,
-    player: {
-        id: 'player-tank',
-        x: CANVAS_WIDTH / 2,
-        y: CANVAS_HEIGHT - 100,
-        width: PLAYER_DEFAULTS.width,
-        height: PLAYER_DEFAULTS.height,
-        angle: -Math.PI / 2,
-        turretAngle: -Math.PI / 2,
-        health: 100,
-        maxHealth: 100,
-        speed: PHYSICS.MAX_SPEED,
-        velocity: { x: 0, y: 0 },
-        color: '#38bdf8', 
-        isShielded: false,
-        shootTimer: 0,
-        shootInterval: PLAYER_DEFAULTS.shootRate,
-        type: 'player',
-        recoilOffset: 0,
-    } as Tank,
+    players: (playerConfigs.length > 0 ? playerConfigs : DEFAULT_CONFIGS).map(
+      (cfg, i, arr) => makePlayer(i, arr.length, cfg),
+    ) as PlayerEntity[],
     enemies: [] as Tank[],
     bullets: [] as SpecializedBullet[],
     repairItems: [] as RepairItem[],
+    energyCells: [] as EnergyCell[],
     explosions: [] as Explosion[],
     particles: [] as Particle[],
     floatingTexts: [] as FloatingText[],
@@ -128,9 +262,12 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     } as BomberSequence,
     keys: {} as Record<string, boolean>,
     mouse: { x: 0, y: 0, pressed: false, rightPressed: false },
-    lastShot: 0,
-    lastFireTime: 0,
-    regenAccumulator: 0,
+    beams: [] as LaserBeam[],
+    reportedAmmo: -1,
+    reportedMaxAmmo: -1,
+    reportedCooldown: false,
+    reportedEnergy: -1,
+    reportedUlt: false,
     spawnTimer: 0,
     difficultyTimer: 0,
     nukeCounter: 0,
@@ -148,7 +285,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
   const REPAIR_KILL_MILESTONE = 10;
 
   const handleMouseMove = (e: React.MouseEvent) => {
-    const canvas = canvasRef.current;
+    const canvas = activeCanvasRef.current;
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
     stateRef.current.mouse.x = (e.clientX - rect.left) * (CANVAS_WIDTH / rect.width);
@@ -207,79 +344,69 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     }
   }, []);
 
-  const initiateReload = useCallback(() => {
-    const s = stateRef.current;
-    if (s.isCooldown || s.ammo === PLAYER_DEFAULTS.maxAmmo) return;
-    
-    s.isCooldown = true;
-    onStateUpdate({ isCooldown: true });
-    
-    setTimeout(() => {
-      if (!gameEndedRef.current) {
-        stateRef.current.ammo = PLAYER_DEFAULTS.maxAmmo;
-        stateRef.current.isCooldown = false;
-        onStateUpdate({ 
-          isCooldown: false, 
-          ammo: PLAYER_DEFAULTS.maxAmmo
-        });
-      }
-    }, RELOAD_DURATION);
-  }, [onStateUpdate]);
+  const initiateReload = useCallback((p: PlayerEntity) => {
+    if (p.isCooldown || p.ammo >= p.maxAmmo) return;
+    p.isCooldown = true;
+    p.reloadTimer = p.reloadDuration;
+  }, []);
 
   const fireBullet = useCallback((tank: Tank, isPlayer: boolean = true, customAngle?: number) => {
     const s = stateRef.current;
-    if (isPlayer && (s.isCooldown || s.ammo <= 0)) return;
+    const pe = isPlayer ? (tank as PlayerEntity) : null;
+    if (pe && (pe.isCooldown || pe.ammo <= 0)) return;
 
     const angle = customAngle ?? tank.turretAngle;
-    const speed = isPlayer ? 18 : (tank.enemyType === EnemyType.Boss ? 4.5 : 4); 
-    const isHighPower = isPlayer && s.ammo <= 10;
+    const isBoss = tank.enemyType === EnemyType.Boss;
+    const speed = pe ? pe.bulletSpeed : isBoss ? 4.5 : 4;
+    const dmg = pe ? pe.damage : isBoss ? 35 : 15;
+    const col = pe ? tank.color : isBoss ? '#a855f7' : '#ef4444';
 
     s.bullets.push({
       id: Math.random().toString(36).substring(2, 10),
       x: tank.x + Math.cos(angle) * (tank.width / 2 + 15),
       y: tank.y + Math.sin(angle) * (tank.width / 2 + 15),
-      width: tank.enemyType === EnemyType.Boss ? 16 : 10, 
-      height: tank.enemyType === EnemyType.Boss ? 30 : 22,
+      width: isBoss ? 16 : 10,
+      height: isBoss ? 30 : 22,
       angle,
       dx: Math.cos(angle) * speed,
       dy: Math.sin(angle) * speed,
-      damage: isHighPower ? 55 : (isPlayer ? 24 : (tank.enemyType === EnemyType.Boss ? 35 : 15)),
-      color: isHighPower ? '#fb7185' : (isPlayer ? '#38bdf8' : (tank.enemyType === EnemyType.Boss ? '#a855f7' : '#ef4444')),
-      isHighPowered: isHighPower,
+      damage: dmg,
+      color: col,
+      isHighPowered: false,
       isSuperBullet: false,
       isExplosive: false,
       isAllied: isPlayer,
-      radius: tank.enemyType === EnemyType.Boss ? 12 : 8,
+      radius: isBoss ? 12 : 8,
       history: [],
       trailHistory: []
     });
 
-    if (isPlayer) {
-      tank.recoilOffset = PHYSICS.RECOIL_FORCE * 7;
-      tank.velocity.x -= Math.cos(angle) * PHYSICS.RECOIL_FORCE;
-      tank.velocity.y -= Math.sin(angle) * PHYSICS.RECOIL_FORCE;
-      s.ammo--;
-      s.lastFireTime = Date.now();
-      audioService.playShoot(isHighPower);
-      s.screenShake = Math.max(s.screenShake, isHighPower ? 6 : 2.5);
-      onStateUpdate({ ammo: s.ammo });
-      if (s.ammo <= 0) initiateReload();
+    if (pe) {
+      pe.recoilOffset = PHYSICS.RECOIL_FORCE * 7;
+      pe.velocity.x -= Math.cos(angle) * PHYSICS.RECOIL_FORCE;
+      pe.velocity.y -= Math.sin(angle) * PHYSICS.RECOIL_FORCE;
+      pe.ammo--;
+      pe.lastFireTime = Date.now();
+      audioService.playShoot(false);
+      s.screenShake = Math.max(s.screenShake, 2.5);
+      if (pe.ammo <= 0) initiateReload(pe);
     }
-  }, [onStateUpdate, initiateReload]);
+  }, [initiateReload]);
 
-  const fireAutoSwarm = useCallback((count: number) => {
+  const fireAutoSwarm = useCallback((count: number, source?: PlayerEntity) => {
     const s = stateRef.current;
+    const src = source ?? s.players[0];
     const targets = [...s.enemies];
-    
+
     for (let i = 0; i < count; i++) {
         const sideOffset = (i % 2 === 0 ? 1 : -1) * (Math.PI / 1.5);
-        const launchAngle = s.player.angle + sideOffset + (Math.random() - 0.5) * 0.4;
+        const launchAngle = src.angle + sideOffset + (Math.random() - 0.5) * 0.4;
         const target = targets[i % targets.length];
-        
+
         s.bullets.push({
             id: `swarm-${Math.random().toString(36).substring(2, 10)}`,
-            x: s.player.x,
-            y: s.player.y,
+            x: src.x,
+            y: src.y,
             width: 12,
             height: 34,
             angle: launchAngle,
@@ -360,7 +487,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     if (s.combo > 0 && s.combo % 10 === 0) {
       fireAutoSwarm(4);
       s.floatingTexts.push({
-        x: s.player.x, y: s.player.y - 120,
+        x: s.players[0].x, y: s.players[0].y - 120,
         text: "STRIKE PROTOCOL: 4 UNITS",
         opacity: 1, lifespan: 150,
         color: '#facc15', size: 36
@@ -374,7 +501,18 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
         x: e.x, y: e.y, radius: 24, lifespan: 1200, opacity: 1
       });
     }
-    
+
+    // Energy: trickle to the team per kill, plus an energy cell every few kills.
+    s.players.forEach((pl) => {
+      if (pl.health > 0) pl.energy = Math.min(pl.maxEnergy, pl.energy + ENERGY_PER_KILL);
+    });
+    if (s.killCount > 0 && s.killCount % ENERGY_DROP_KILLS === 0) {
+      s.energyCells.push({
+        id: Math.random().toString(36).substring(2, 9),
+        x: e.x, y: e.y, radius: 16, lifespan: 1400, opacity: 1,
+      });
+    }
+
     if (e.enemyType === EnemyType.Boss) {
       s.screenShake = Math.max(s.screenShake, 80);
     } else {
@@ -402,7 +540,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
 
   const resolveTankCollisions = useCallback(() => {
     const s = stateRef.current;
-    const tanks = [s.player, ...s.enemies];
+    const tanks = [...s.players, ...s.enemies];
 
     for (let i = 0; i < tanks.length; i++) {
         for (let j = i + 1; j < tanks.length; j++) {
@@ -500,26 +638,15 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
   const update = useCallback((delta: number) => {
     const s = stateRef.current;
     if (statusRef.current !== 'playing' || gameEndedRef.current) return;
-    
-    if (s.keys['KeyR']) initiateReload();
 
-    if (!s.isCooldown && s.ammo < PLAYER_DEFAULTS.maxAmmo && Date.now() - s.lastFireTime > REGEN_IDLE_TIME) {
-        s.regenAccumulator += delta;
-        if (s.regenAccumulator > 500) {
-            s.ammo = Math.min(PLAYER_DEFAULTS.maxAmmo, s.ammo + 2);
-            s.regenAccumulator = 0;
-            onStateUpdate({ ammo: s.ammo });
-        }
-    }
+    // Resolve this player's controls through the shared PlayerInput seam (Phase 3).
+    // Second-player and remote inputs will be injected the same way in later phases,
+    // so the simulation never reads hardware (keys/mouse) directly.
+    const inputs = sampleLocalInputs(s.keys, s.mouse, s.players, s.players.length, s.enemies);
+    // Reload, ammo regen and firing are handled per-player inside the movement loop below.
 
     if (s.screenShake > 0) s.screenShake *= 0.93;
     if (s.screenFlash > 0) s.screenFlash -= 0.04;
-
-    let drive = 0; let turn = 0;
-    if (s.keys['KeyW'] || s.keys['ArrowUp']) drive += 1;
-    if (s.keys['KeyS'] || s.keys['ArrowDown']) drive -= 0.85;
-    if (s.keys['KeyA'] || s.keys['ArrowLeft']) turn -= 1;
-    if (s.keys['KeyD'] || s.keys['ArrowRight']) turn += 1;
 
     // Dynamic Traction/Friction calculations based on Weather or Terrain
     let currentFriction = PHYSICS.FRICTION; // default 0.94
@@ -548,92 +675,222 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     } else if (s.weather === WeatherType.Sandstorm) {
       currentFriction = Math.max(currentFriction, 0.925);
       currentAccelFactor *= 0.82;
-      // Constant westward sand wind push
-      s.player.velocity.x -= 0.095;
+      // Constant westward sand wind push is applied per-player in the movement loop below.
     }
 
-    s.player.angle += turn * PHYSICS.CHASSIS_TURN_SPEED * currentTurnFactor;
-    const accel = drive * PHYSICS.ACCELERATION * currentAccelFactor;
-    s.player.velocity.x += Math.cos(s.player.angle) * accel;
-    s.player.velocity.y += Math.sin(s.player.angle) * accel;
-    s.player.velocity.x *= currentFriction;
-    s.player.velocity.y *= currentFriction;
-    s.player.x += s.player.velocity.x;
-    s.player.y += s.player.velocity.y;
-    
-    const playerSpeed = Math.hypot(s.player.velocity.x, s.player.velocity.y);
-    
-    // UTILITY: Spawn physical track tread marks behind moving tanks
+    // Tread-mark helper (shared across all tanks).
     const addTreadMarkObj = (t: Tank, col: string) => {
       const angle = t.angle;
       const L = t.width;
       const W = t.height;
-      // Left tread position relative to angle
-      const lx = t.x - Math.cos(angle) * (L/4) + Math.sin(angle) * (W/2 - 4);
-      const ly = t.y - Math.sin(angle) * (L/4) - Math.cos(angle) * (W/2 - 4);
-      // Right tread position
-      const rx = t.x - Math.cos(angle) * (L/4) - Math.sin(angle) * (W/2 - 4);
-      const ry = t.y - Math.sin(angle) * (L/4) + Math.cos(angle) * (W/2 - 4);
-      
+      const lx = t.x - Math.cos(angle) * (L / 4) + Math.sin(angle) * (W / 2 - 4);
+      const ly = t.y - Math.sin(angle) * (L / 4) - Math.cos(angle) * (W / 2 - 4);
+      const rx = t.x - Math.cos(angle) * (L / 4) - Math.sin(angle) * (W / 2 - 4);
+      const ry = t.y - Math.sin(angle) * (L / 4) + Math.cos(angle) * (W / 2 - 4);
       const width = t.width * 0.16;
       s.treadMarks.push({ x: lx, y: ly, angle, opacity: 0.38, color: col, width });
       s.treadMarks.push({ x: rx, y: ry, angle, opacity: 0.38, color: col, width });
     };
 
-    const treadMarkColor = s.terrain === TerrainType.Desert ? 'rgba(139, 90, 43, 0.22)' :
-                           (s.terrain === TerrainType.Snow ? 'rgba(100, 116, 139, 0.15)' : 'rgba(15, 23, 42, 0.25)');
+    const treadMarkColor =
+      s.terrain === TerrainType.Desert
+        ? 'rgba(139, 90, 43, 0.22)'
+        : s.terrain === TerrainType.Snow
+          ? 'rgba(100, 116, 139, 0.15)'
+          : 'rgba(15, 23, 42, 0.25)';
 
-    // Spawn tracks for player when moving
-    if (playerSpeed > 0.45 && Math.random() < 0.65) {
-      addTreadMarkObj(s.player, treadMarkColor);
-    }
+    // Per-player movement, aiming and firing. Each tank has its own fire cadence;
+    // ammo / combo / specials are shared team resources (co-op).
+    for (let pi = 0; pi < s.players.length; pi++) {
+      const p = s.players[pi];
+      const pin = inputs[pi] ?? EMPTY_INPUT;
+      if (p.health <= 0) continue;
 
-    // Engine exhaust and drift slippage particles for player
-    if (playerSpeed > 0.3) {
-      if (Math.random() < 0.38) {
-        const exAngle = s.player.angle + Math.PI;
-        const exX = s.player.x + Math.cos(exAngle) * (s.player.width / 2);
-        const exY = s.player.y + Math.sin(exAngle) * (s.player.width / 2);
-        s.particles.push({
-          x: exX, y: exY,
-          dx: Math.cos(exAngle + (Math.random()-0.5)*0.2) * (playerSpeed * 0.4),
-          dy: Math.sin(exAngle + (Math.random()-0.5)*0.2) * (playerSpeed * 0.4),
-          radius: Math.random() * 3.5 + 1.2,
-          opacity: 0.55,
-          lifespan: Math.random() * 18 + 12,
-          color: s.terrain === TerrainType.Desert ? 'rgba(217, 119, 6, 0.25)' : 'rgba(148, 163, 184, 0.3)',
-          type: 'exhaust'
-        });
+      if (s.weather === WeatherType.Sandstorm) p.velocity.x -= 0.095;
+
+      p.angle += pin.turn * PHYSICS.CHASSIS_TURN_SPEED * currentTurnFactor;
+      const accel = pin.drive * PHYSICS.ACCELERATION * currentAccelFactor;
+      p.velocity.x += Math.cos(p.angle) * accel;
+      p.velocity.y += Math.sin(p.angle) * accel;
+      p.velocity.x *= currentFriction;
+      p.velocity.y *= currentFriction;
+      p.x += p.velocity.x;
+      p.y += p.velocity.y;
+
+      const playerSpeed = Math.hypot(p.velocity.x, p.velocity.y);
+
+      if (playerSpeed > 0.45 && Math.random() < 0.65) addTreadMarkObj(p, treadMarkColor);
+
+      if (playerSpeed > 0.3) {
+        if (Math.random() < 0.38) {
+          const exAngle = p.angle + Math.PI;
+          const exX = p.x + Math.cos(exAngle) * (p.width / 2);
+          const exY = p.y + Math.sin(exAngle) * (p.width / 2);
+          s.particles.push({
+            x: exX,
+            y: exY,
+            dx: Math.cos(exAngle + (Math.random() - 0.5) * 0.2) * (playerSpeed * 0.4),
+            dy: Math.sin(exAngle + (Math.random() - 0.5) * 0.2) * (playerSpeed * 0.4),
+            radius: Math.random() * 3.5 + 1.2,
+            opacity: 0.55,
+            lifespan: Math.random() * 18 + 12,
+            color: s.terrain === TerrainType.Desert ? 'rgba(217, 119, 6, 0.25)' : 'rgba(148, 163, 184, 0.3)',
+            type: 'exhaust',
+          });
+        }
+
+        if ((s.weather === WeatherType.Snowstorm || s.terrain === TerrainType.Snow) && playerSpeed > 1.0 && Math.random() < 0.3) {
+          const sprayAngle = p.angle + Math.PI + (Math.random() - 0.5) * 0.6;
+          s.particles.push({
+            x: p.x - Math.cos(p.angle) * (p.width / 3),
+            y: p.y - Math.sin(p.angle) * (p.height / 3),
+            dx: Math.cos(sprayAngle) * (playerSpeed * 0.5) + (Math.random() - 0.5) * 0.5,
+            dy: Math.sin(sprayAngle) * (playerSpeed * 0.5) + (Math.random() - 0.5) * 0.5,
+            radius: Math.random() * 3 + 1,
+            opacity: 0.6,
+            lifespan: 12 + Math.random() * 8,
+            color: '#e2e8f0',
+            type: 'snow',
+          });
+        }
       }
 
-      // If slipping heavily in snow/blizzard/rain, spray slush/spray particles from treads
-      if ((s.weather === WeatherType.Snowstorm || s.terrain === TerrainType.Snow) && playerSpeed > 1.0 && Math.random() < 0.3) {
-        const sprayAngle = s.player.angle + Math.PI + (Math.random() - 0.5) * 0.6;
-        s.particles.push({
-          x: s.player.x - Math.cos(s.player.angle) * (s.player.width / 3),
-          y: s.player.y - Math.sin(s.player.angle) * (s.player.height / 3),
-          dx: Math.cos(sprayAngle) * (playerSpeed * 0.5) + (Math.random() - 0.5) * 0.5,
-          dy: Math.sin(sprayAngle) * (playerSpeed * 0.5) + (Math.random() - 0.5) * 0.5,
-          radius: Math.random() * 3 + 1,
-          opacity: 0.6,
-          lifespan: 12 + Math.random() * 8,
-          color: '#e2e8f0',
-          type: 'snow'
-        });
-      }
-    }
-    
-    const tAngle = Math.atan2(s.mouse.y - s.player.y, s.mouse.x - s.player.x);
-    let turretDiff = tAngle - s.player.turretAngle;
-    while (turretDiff < -Math.PI) turretDiff += Math.PI * 2;
-    while (turretDiff > Math.PI) turretDiff -= Math.PI * 2;
-    s.player.turretAngle += Math.max(-PHYSICS.TURRET_TURN_SPEED, Math.min(PHYSICS.TURRET_TURN_SPEED, turretDiff));
+      let turretDiff = pin.aim - p.turretAngle;
+      while (turretDiff < -Math.PI) turretDiff += Math.PI * 2;
+      while (turretDiff > Math.PI) turretDiff -= Math.PI * 2;
+      p.turretAngle += Math.max(-PHYSICS.TURRET_TURN_SPEED, Math.min(PHYSICS.TURRET_TURN_SPEED, turretDiff));
 
-    if (s.mouse.pressed && Date.now() - s.lastShot > PLAYER_DEFAULTS.shootRate) {
-      fireBullet(s.player, true);
-      s.lastShot = Date.now();
+      // Per-player reload countdown.
+      if (p.isCooldown) {
+        p.reloadTimer -= delta;
+        if (p.reloadTimer <= 0) {
+          p.ammo = p.maxAmmo;
+          p.isCooldown = false;
+        }
+      }
+      p.reloading = p.isCooldown; // mirror for the renderer's ammo bar
+      // Manual reload.
+      if (pin.reload) initiateReload(p);
+      // Idle ammo regen (only for classes that allow it).
+      if (p.regen && !p.isCooldown && p.ammo < p.maxAmmo && Date.now() - p.lastFireTime > REGEN_IDLE_TIME) {
+        p.regenAccumulator += delta;
+        if (p.regenAccumulator > 500) {
+          p.ammo = Math.min(p.maxAmmo, p.ammo + 2);
+          p.regenAccumulator = 0;
+        }
+      }
+
+      // Fire (laser hitscan for the railgun, projectile otherwise).
+      if (pin.fire && !p.isCooldown && p.ammo > 0 && Date.now() - p.lastShot > p.fireRate) {
+        if (p.weapon === 'laser') {
+          const ox = p.x + Math.cos(p.turretAngle) * (p.width / 2);
+          const oy = p.y + Math.sin(p.turretAngle) * (p.width / 2);
+          const dirx = Math.cos(p.turretAngle);
+          const diry = Math.sin(p.turretAngle);
+          // Piercing: damage every enemy whose centre lies near the ray.
+          s.enemies.forEach((e) => {
+            const relx = e.x - ox;
+            const rely = e.y - oy;
+            const t = relx * dirx + rely * diry;
+            if (t < 0 || t > LASER_RANGE) return;
+            const perp = Math.abs(relx * diry - rely * dirx);
+            if (perp < e.width / 2 + 8) {
+              e.health -= p.damage;
+              createParticles(ox + dirx * t, oy + diry * t, e.color, 10, 'spark');
+              if (e.health <= 0) onEnemyKill(e);
+            }
+          });
+          s.beams.push({
+            x1: ox,
+            y1: oy,
+            x2: ox + dirx * LASER_RANGE,
+            y2: oy + diry * LASER_RANGE,
+            color: p.color,
+            life: 12,
+            maxLife: 12,
+            width: 6,
+          });
+          p.ammo--;
+          p.lastFireTime = Date.now();
+          p.recoilOffset = PHYSICS.RECOIL_FORCE * 9;
+          audioService.playShoot(true);
+          s.screenShake = Math.max(s.screenShake, 16);
+          if (p.ammo <= 0) initiateReload(p);
+        } else {
+          fireBullet(p, true);
+        }
+        p.lastShot = Date.now();
+      }
+
+      // ── Ultimate ──────────────────────────────────────────────────────
+      // MAELSTROM (Vanguard): while active, emit a rotating spiral of bullets.
+      if (p.ultActiveTimer > 0) {
+        p.ultActiveTimer -= delta;
+        p.ultSpin += 0.45;
+        for (let k = 0; k < 2; k++) {
+          const a = p.ultSpin + (k / 2) * Math.PI * 2;
+          s.bullets.push({
+            id: Math.random().toString(36).substring(2, 10),
+            x: p.x + Math.cos(a) * (p.width / 2),
+            y: p.y + Math.sin(a) * (p.width / 2),
+            width: 9, height: 20, angle: a,
+            dx: Math.cos(a) * 16, dy: Math.sin(a) * 16,
+            damage: 22, color: p.color,
+            isHighPowered: false, isSuperBullet: false, isExplosive: false,
+            isAllied: true, radius: 7, history: [], trailHistory: [],
+          });
+        }
+      }
+
+      // Trigger an ultimate when the energy gauge is full.
+      if (pin.ult && p.energy >= p.maxEnergy && p.ultActiveTimer <= 0) {
+        p.energy = 0;
+        const accent = TANK_CLASSES[p.tankClass].accent;
+        s.floatingTexts.push({
+          x: p.x, y: p.y - 90, text: ULTIMATES[p.tankClass].label,
+          opacity: 1, lifespan: 130, color: accent, size: 34,
+        });
+        if (p.tankClass === 'assault') {
+          // VALKYRIE BARRAGE: missile salvo + shockwave nova.
+          fireAutoSwarm(12, p);
+          s.explosions.push({ x: p.x, y: p.y, radius: 10, maxRadius: 320, opacity: 1, fadeSpeed: 0.02, color: accent });
+          s.enemies.forEach((e) => {
+            if (Math.hypot(e.x - p.x, e.y - p.y) < 320) { e.health -= 80; if (e.health <= 0) onEnemyKill(e); }
+          });
+          s.screenFlash = Math.max(s.screenFlash, 0.6);
+          s.screenShake = Math.max(s.screenShake, 60);
+        } else if (p.tankClass === 'vanguard') {
+          // MAELSTROM: spin up for 3s (handled above while active).
+          p.ultActiveTimer = 3000;
+          p.ultSpin = 0;
+          s.screenFlash = Math.max(s.screenFlash, 0.3);
+          s.screenShake = Math.max(s.screenShake, 30);
+        } else {
+          // ORBITAL LANCE (railgun): colossal screen-piercing beam.
+          const dirx = Math.cos(p.turretAngle);
+          const diry = Math.sin(p.turretAngle);
+          s.enemies.forEach((e) => {
+            const relx = e.x - p.x;
+            const rely = e.y - p.y;
+            const t = relx * dirx + rely * diry;
+            if (t < 0 || t > LASER_RANGE) return;
+            const perp = Math.abs(relx * diry - rely * dirx);
+            if (perp < e.width / 2 + 45) {
+              e.health -= 400;
+              createParticles(p.x + dirx * t, p.y + diry * t, '#ffffff', 18, 'spark');
+              if (e.health <= 0) onEnemyKill(e);
+            }
+          });
+          s.beams.push({ x1: p.x, y1: p.y, x2: p.x + dirx * LASER_RANGE, y2: p.y + diry * LASER_RANGE, color: '#ffffff', life: 22, maxLife: 22, width: 42 });
+          s.screenFlash = Math.max(s.screenFlash, 1.0);
+          s.screenShake = Math.max(s.screenShake, 120);
+        }
+        audioService.playNuke();
+      }
+      p.ultReady = p.energy >= p.maxEnergy;
+
+      p.recoilOffset *= 0.75;
     }
-    s.player.recoilOffset *= 0.75;
 
     if (s.score - s.lastBossScore >= BOSS_SCORE_THRESHOLD) {
       s.lastBossScore = s.score;
@@ -660,8 +917,9 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     s.spawnIndicators = s.spawnIndicators.filter(ind => ind.timer > 0);
 
     s.enemies.forEach(e => {
-      const dist = Math.hypot(s.player.x - e.x, s.player.y - e.y);
-      const angle = Math.atan2(s.player.y - e.y, s.player.x - e.x);
+      const target = nearestPlayer(s.players, e);
+      const dist = Math.hypot(target.x - e.x, target.y - e.y);
+      const angle = Math.atan2(target.y - e.y, target.x - e.x);
 
       // Determine detection status based on current active weather settings
       let detectsPlayer = true;
@@ -746,8 +1004,10 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     resolveTankCollisions();
 
     // Bound Checks after collision resolution
-    s.player.x = Math.max(30, Math.min(CANVAS_WIDTH - 30, s.player.x));
-    s.player.y = Math.max(30, Math.min(CANVAS_HEIGHT - 30, s.player.y));
+    for (const p of s.players) {
+      p.x = Math.max(30, Math.min(CANVAS_WIDTH - 30, p.x));
+      p.y = Math.max(30, Math.min(CANVAS_HEIGHT - 30, p.y));
+    }
 
     const bToRemove = new Set<string>();
     
@@ -787,9 +1047,9 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
                   });
                   if (nearest) b.targetId = (nearest as Tank).id;
                   else {
-                      const orbitAngle = Math.atan2(b.y - s.player.y, b.x - s.player.x) + 0.05;
-                      const tx = s.player.x + Math.cos(orbitAngle) * 220;
-                      const ty = s.player.y + Math.sin(orbitAngle) * 220;
+                      const orbitAngle = Math.atan2(b.y - s.players[0].y, b.x - s.players[0].x) + 0.05;
+                      const tx = s.players[0].x + Math.cos(orbitAngle) * 220;
+                      const ty = s.players[0].y + Math.sin(orbitAngle) * 220;
                       const targetAngle = Math.atan2(ty - b.y, tx - b.x);
                       let angleDiff = targetAngle - b.angle;
                       while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
@@ -828,11 +1088,15 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
           }
         });
       } else {
-        if (Math.hypot(b.x - s.player.x, b.y - s.player.y) < s.player.width/2) {
-          s.player.health -= b.damage; bToRemove.add(b.id);
-          audioService.playHit(); 
-          s.screenShake = Math.max(s.screenShake, b.damage * 1.5 + 10);
-          if (s.player.health <= 0) { gameEndedRef.current = true; onGameOver(s.score, s.maxCombo); }
+        for (const p of s.players) {
+          if (p.health <= 0) continue;
+          if (Math.hypot(b.x - p.x, b.y - p.y) < p.width / 2) {
+            p.health -= b.damage; bToRemove.add(b.id);
+            audioService.playHit();
+            s.screenShake = Math.max(s.screenShake, b.damage * 1.5 + 10);
+            if (s.players.every((pl) => pl.health <= 0)) { gameEndedRef.current = true; onGameOver(s.score, s.maxCombo); }
+            break;
+          }
         }
       }
     });
@@ -844,26 +1108,52 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     });
     
     s.enemies = s.enemies.filter(e => e.health > 0);
-    
+
+    // Decay laser beams (renderer-side visual would also work; kept in sim for the snapshot).
+    s.beams.forEach((b) => (b.life -= 1));
+    s.beams = s.beams.filter((b) => b.life > 0);
+
     s.repairItems.forEach(item => {
       item.lifespan--; if (item.lifespan < 100) item.opacity = item.lifespan / 100;
-      if (Math.hypot(s.player.x - item.x, s.player.y - item.y) < 65) {
-        s.player.health = 100; item.lifespan = 0; audioService.playRepair();
+      for (const p of s.players) {
+        if (p.health > 0 && Math.hypot(p.x - item.x, p.y - item.y) < 65) {
+          p.health = p.maxHealth; item.lifespan = 0; audioService.playRepair(); break;
+        }
       }
     });
     s.repairItems = s.repairItems.filter(i => i.lifespan > 0);
 
-    if (s.keys['KeyQ'] && s.nukeCounter >= NUKE_TARGET) {
+    // Energy cells: collected per-player to charge the ultimate gauge.
+    s.energyCells.forEach((item) => {
+      item.lifespan--;
+      if (item.lifespan < 100) item.opacity = item.lifespan / 100;
+      for (const p of s.players) {
+        if (p.health > 0 && Math.hypot(p.x - item.x, p.y - item.y) < 60) {
+          p.energy = Math.min(p.maxEnergy, p.energy + ENERGY_CELL_VALUE);
+          item.lifespan = 0;
+          audioService.playNotification();
+          createParticles(item.x, item.y, '#a78bfa', 14, 'spark');
+          break;
+        }
+      }
+    });
+    s.energyCells = s.energyCells.filter((i) => i.lifespan > 0);
+
+    const nukeIdx = inputs.findIndex((i) => i.nuke);
+    if (nukeIdx >= 0 && s.nukeCounter >= NUKE_TARGET) {
+      const origin = s.players[nukeIdx] ?? s.players[0];
       s.nukeCounter = 0; s.screenShake = 150; s.screenFlash = 1.0;
-      s.explosions.push({ x: s.player.x, y: s.player.y, radius: 10, maxRadius: 1800, opacity: 1, fadeSpeed: 0.008, color: '#fef3c7' });
+      s.explosions.push({ x: origin.x, y: origin.y, radius: 10, maxRadius: 1800, opacity: 1, fadeSpeed: 0.008, color: '#fef3c7' });
       s.enemies.forEach(e => { if(e.enemyType === EnemyType.Boss) e.health -= 600; else e.health = 0; onEnemyKill(e); });
       s.bullets = s.bullets.filter(b => b.isAllied);
       audioService.playNuke();
       onStateUpdate({ nukeReady: false, nukeProgress: 0 });
     }
 
-    if (s.keys['KeyF'] && s.bomberCounter >= BOMBER_TARGET && !s.bomber.active) {
-      s.bomberCounter = 0; s.bomber.active = true; s.bomber.x = -600; s.bomber.y = s.player.y; s.bomber.lastDropX = -600;
+    const bomberIdx = inputs.findIndex((i) => i.bomber);
+    if (bomberIdx >= 0 && s.bomberCounter >= BOMBER_TARGET && !s.bomber.active) {
+      const origin = s.players[bomberIdx] ?? s.players[0];
+      s.bomberCounter = 0; s.bomber.active = true; s.bomber.x = -600; s.bomber.y = origin.y; s.bomber.lastDropX = -600;
       onStateUpdate({ bomberReady: false, bomberProgress: 0 });
     }
     if (s.bomber.active) {
@@ -908,7 +1198,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
                            (nextWeather === WeatherType.Sandstorm ? '#f59e0b' : '#94a3b8')));
 
       s.floatingTexts.push({
-        x: s.player.x, y: s.player.y - 120,
+        x: s.players[0].x, y: s.players[0].y - 120,
         text: `SURROUNDINGS CHANGED: ${nextTerrain.toUpperCase()} | ${nextWeather.toUpperCase()}`,
         opacity: 1, lifespan: 180,
         color: shiftColor, size: 18
@@ -996,6 +1286,32 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     }
 
     if (s.combo > 0 && Date.now() - s.lastComboTime > COMBO_TIMEOUT) { s.combo = 0; onStateUpdate({ combo: 0 }); }
+
+    // Report player 1's ammo/reload to the HUD only when it changes.
+    const p0 = s.players[0];
+    if (
+      p0 &&
+      (p0.ammo !== s.reportedAmmo ||
+        p0.isCooldown !== s.reportedCooldown ||
+        p0.maxAmmo !== s.reportedMaxAmmo ||
+        p0.energy !== s.reportedEnergy ||
+        !!p0.ultReady !== s.reportedUlt)
+    ) {
+      s.reportedAmmo = p0.ammo;
+      s.reportedCooldown = p0.isCooldown;
+      s.reportedMaxAmmo = p0.maxAmmo;
+      s.reportedEnergy = p0.energy;
+      s.reportedUlt = !!p0.ultReady;
+      onStateUpdate({
+        ammo: p0.ammo,
+        maxAmmo: p0.maxAmmo,
+        isCooldown: p0.isCooldown,
+        energy: p0.energy,
+        maxEnergy: p0.maxEnergy,
+        ultReady: !!p0.ultReady,
+        ultName: ULTIMATES[p0.tankClass].label,
+      });
+    }
   }, [onStateUpdate, status, onGameOver, spawnSpecificEnemy, fireBullet, onEnemyKill, initiateReload, createParticles, fireAutoSwarm, requestSpawn, resolveTankCollisions]);
 
   const drawTank = (ctx: CanvasRenderingContext2D, t: Tank) => {
@@ -1250,9 +1566,37 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     ctx.restore(); // restored root translation matrix
   };
 
-  const draw = useCallback((ctx: CanvasRenderingContext2D) => {
-    const s = stateRef.current;
-    
+  // Phase 3 seam: bundle the live world into a snapshot the renderer consumes
+  // instead of reaching into stateRef. The Pixi renderer (Phase 4) and netcode
+  // (Phase 6) read this same shape. Holds references (not deep copies) — cheap
+  // for local rendering; serialised when networked.
+  const buildSnapshot = useCallback((): WorldSnapshot => {
+    const cs = stateRef.current;
+    return {
+      players: cs.players,
+      player: cs.players[0],
+      enemies: cs.enemies,
+      bullets: cs.bullets,
+      repairItems: cs.repairItems,
+      energyCells: cs.energyCells,
+      explosions: cs.explosions,
+      particles: cs.particles,
+      floatingTexts: cs.floatingTexts,
+      spawnIndicators: cs.spawnIndicators,
+      treadMarks: cs.treadMarks,
+      beams: cs.beams,
+      bomber: cs.bomber,
+      weather: cs.weather,
+      terrain: cs.terrain,
+      difficulty: cs.difficulty,
+      screenShake: cs.screenShake,
+      screenFlash: cs.screenFlash,
+      arena: { w: CANVAS_WIDTH, h: CANVAS_HEIGHT },
+    };
+  }, []);
+
+  const draw = useCallback((ctx: CanvasRenderingContext2D, s: WorldSnapshot) => {
+
     // Smoothly apply viewport CSS transforms for beautiful high-fidelity tactile shake
     if (canvasRef.current) {
       if (s.screenShake > 0.1) {
@@ -1328,7 +1672,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     });
 
     s.enemies.forEach(e => drawTank(ctx, e));
-    drawTank(ctx, s.player);
+    s.players.forEach(p => drawTank(ctx, p));
 
     s.bullets.forEach(b => {
       ctx.save(); ctx.translate(b.x, b.y); ctx.rotate(b.angle);
@@ -1456,24 +1800,66 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     ctx.restore();
   }, []);
 
+  // Mount the WebGL (PixiJS) renderer; fall back to Canvas2D if WebGL is unavailable.
   useEffect(() => {
-    const canvas = canvasRef.current; if (!canvas) return;
-    const ctx = canvas.getContext('2d'); if (!ctx) return;
+    const container = containerRef.current;
+    if (!container) return;
+    let disposed = false;
+    const renderer = new PixiRenderer();
+    renderer
+      .init(container, graphicsQuality)
+      .then(() => {
+        if (disposed) {
+          renderer.destroy();
+          return;
+        }
+        pixiRef.current = renderer;
+        activeCanvasRef.current = (renderer.app?.canvas as HTMLCanvasElement) ?? null;
+      })
+      .catch((err) => {
+        console.warn('WebGL unavailable — using Canvas2D fallback.', err);
+        const canvas = document.createElement('canvas');
+        canvas.width = CANVAS_WIDTH;
+        canvas.height = CANVAS_HEIGHT;
+        canvas.className =
+          'bg-slate-950 border-4 border-slate-900 rounded-2xl shadow-[0_0_120px_rgba(0,0,0,0.9)] cursor-crosshair';
+        container.appendChild(canvas);
+        canvasRef.current = canvas;
+        activeCanvasRef.current = canvas;
+        ctx2dRef.current = canvas.getContext('2d');
+      });
+    return () => {
+      disposed = true;
+      pixiRef.current?.destroy();
+      pixiRef.current = null;
+      ctx2dRef.current = null;
+      container.replaceChildren();
+    };
+  }, [graphicsQuality]);
+
+  useEffect(() => {
     let lastTime = performance.now();
     let rafId = 0;
     const loop = (time: number) => {
       const d = Math.min(time - lastTime, 100); lastTime = time;
-      update(d); draw(ctx); rafId = requestAnimationFrame(loop);
+      update(d);
+      const snap = buildSnapshot();
+      if (pixiRef.current) pixiRef.current.render(snap);
+      else if (ctx2dRef.current) draw(ctx2dRef.current, snap);
+      rafId = requestAnimationFrame(loop);
     };
     rafId = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(rafId);
-  }, [update, draw]);
+  }, [update, draw, buildSnapshot]);
 
   return (
-    <canvas 
-      ref={canvasRef} width={CANVAS_WIDTH} height={CANVAS_HEIGHT}
-      className="bg-slate-950 border-4 border-slate-900 rounded-2xl shadow-[0_0_120px_rgba(0,0,0,0.9)] cursor-crosshair"
-      onMouseMove={handleMouseMove} onMouseDown={handleMouseDown} onMouseUp={handleMouseUp} onContextMenu={handleContextMenu}
+    <div
+      ref={containerRef}
+      className="relative leading-none"
+      onMouseMove={handleMouseMove}
+      onMouseDown={handleMouseDown}
+      onMouseUp={handleMouseUp}
+      onContextMenu={handleContextMenu}
     />
   );
 };

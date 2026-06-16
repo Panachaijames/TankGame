@@ -13,6 +13,8 @@ export interface Entity {
   angle: number; // Chassis angle
 }
 
+export type TankClass = 'assault' | 'vanguard' | 'sniper';
+
 export interface Tank extends Entity {
   turretAngle: number;
   health: number;
@@ -27,6 +29,15 @@ export interface Tank extends Entity {
   enemyType?: EnemyType;
   recoilOffset: number;
   specialAttackTimer?: number;
+  // Player-only weapon/loadout fields (used by the renderer for the ammo bar,
+  // barrel shape and class accent). Undefined on enemies.
+  tankClass?: TankClass;
+  ammo?: number;
+  maxAmmo?: number;
+  reloading?: boolean;
+  energy?: number;
+  maxEnergy?: number;
+  ultReady?: boolean;
 }
 
 export interface Bullet extends Entity {
@@ -112,6 +123,10 @@ export interface GameState {
   missiles: number;
   isCooldown: boolean;
   cooldownRemaining: number;
+  energy: number;
+  maxEnergy: number;
+  ultReady: boolean;
+  ultName: string;
   status: GameStatus;
 }
 
@@ -140,6 +155,7 @@ export interface PlayerConfig {
   control: 'wasd' | 'arrows' | 'gamepad' | 'remote';
   color: string;
   isLocal: boolean;
+  tankClass: TankClass;
 }
 
 export interface MatchOptions {

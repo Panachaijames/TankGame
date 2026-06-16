@@ -24,10 +24,9 @@ const OPTIONS: SessionOption[] = [
   {
     kind: 'local2p',
     title: 'LOCAL 2P',
-    blurb: 'Two pilots, one screen. Co-op or versus on a shared keyboard / gamepads.',
+    blurb: 'Two pilots, one screen. Co-op on a shared keyboard (P2: arrow keys) or a gamepad.',
     icon: '🎮',
-    enabled: false,
-    note: 'PHASE 5',
+    enabled: true,
   },
   {
     kind: 'online',

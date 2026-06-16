@@ -88,6 +88,23 @@ const HUD: React.FC<HUDProps> = ({ state }) => {
           </div>
         </div>
 
+        {/* Module 3.5: Ultimate */}
+        <div className="flex-1 bg-slate-900/60 backdrop-blur-xl border border-slate-700/50 rounded-xl px-4 flex items-center shadow-[0_4px_20px_rgba(0,0,0,0.4)]">
+          <div className="flex-1">
+            <div className="flex justify-between items-center mb-1">
+              <span className={`text-[9px] font-bold tracking-tighter ${state.ultReady ? 'text-yellow-300 animate-pulse' : 'text-fuchsia-400/80'}`}>
+                {state.ultReady ? `${state.ultName} [E]` : state.ultName || 'ULTIMATE'}
+              </span>
+            </div>
+            <div className="h-1.5 bg-slate-800 rounded-full overflow-hidden">
+              <div
+                className={`h-full transition-all duration-300 ${state.ultReady ? 'bg-yellow-300 shadow-[0_0_8px_rgba(253,224,71,0.7)]' : 'bg-fuchsia-500'}`}
+                style={{ width: `${Math.min(100, (state.energy / Math.max(1, state.maxEnergy)) * 100)}%` }}
+              />
+            </div>
+          </div>
+        </div>
+
         {/* Module 4: Level */}
         <div className="bg-slate-900/60 backdrop-blur-xl border border-slate-700/50 rounded-xl px-4 flex flex-col justify-center items-center shadow-[0_4px_20px_rgba(0,0,0,0.4)]">
           <span className="text-[10px] text-slate-500 uppercase leading-none mb-1">Level</span>

@@ -13,7 +13,7 @@ import PauseMenu from './components/overlays/PauseMenu';
 import AnimatedBackground from './components/ui/AnimatedBackground';
 import { type GameState, type MatchConfig, WeatherType, TerrainType } from './types';
 import { audioService } from './services/audioService';
-import { SettingsProvider } from './state/SettingsContext';
+import { SettingsProvider, useSettings } from './state/SettingsContext';
 import { LeaderboardProvider } from './state/LeaderboardContext';
 import { AppShellProvider, useShell } from './state/AppShellContext';
 
@@ -33,11 +33,16 @@ const freshGameState = (difficulty: number): GameState => ({
   missiles: 0,
   isCooldown: false,
   cooldownRemaining: 0,
+  energy: 0,
+  maxEnergy: 100,
+  ultReady: false,
+  ultName: '',
   status: 'playing',
 });
 
 const GameRoot: React.FC = () => {
   const { shell, dispatch } = useShell();
+  const { settings } = useSettings();
   const [gameId, setGameId] = useState(0);
   const [gameState, setGameState] = useState<GameState>(() => ({
     ...freshGameState(1),
@@ -150,6 +155,8 @@ const GameRoot: React.FC = () => {
             onStateUpdate={updateStateFromGame}
             difficulty={gameState.difficulty}
             status={gameState.status}
+            graphicsQuality={settings.graphicsQuality}
+            playerConfigs={shell.match?.players ?? []}
           />
           <HUD state={gameState} />
           <TopMenuBar config={shell.match} onPause={togglePause} />

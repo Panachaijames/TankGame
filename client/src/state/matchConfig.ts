@@ -1,19 +1,26 @@
-import type { MatchConfig, SessionKind, MatchMode } from '../types';
+import type { MatchConfig, SessionKind, MatchMode, TankClass } from '../types';
 
 export const PLAYER_COLORS = ['#38bdf8', '#fbbf24', '#22c55e', '#a855f7'];
 
 /**
- * Build the MatchConfig handed to the simulation. In Phase 2 only `solo` is
- * launchable; local2p/online seats are wired in Phases 5–7. The shape is
- * already N-player-ready so later phases only add players, not new plumbing.
+ * Build the MatchConfig handed to the simulation. The shape is N-player-ready;
+ * each player carries its own tank class (loadout).
  */
 export function createMatchConfig(
   session: SessionKind,
   mode: MatchMode,
-  options?: { startDifficulty?: number },
+  options?: { startDifficulty?: number; classes?: TankClass[] },
 ): MatchConfig {
+  const classes = options?.classes ?? [];
   const players: MatchConfig['players'] = [
-    { id: 'p1', name: 'Player 1', control: 'wasd', color: PLAYER_COLORS[0], isLocal: true },
+    {
+      id: 'p1',
+      name: 'Player 1',
+      control: 'wasd',
+      color: PLAYER_COLORS[0],
+      isLocal: true,
+      tankClass: classes[0] ?? 'assault',
+    },
   ];
 
   if (session === 'local2p') {
@@ -23,6 +30,7 @@ export function createMatchConfig(
       control: 'arrows',
       color: PLAYER_COLORS[1],
       isLocal: true,
+      tankClass: classes[1] ?? 'vanguard',
     });
   }
   // Online players are added as they join the lobby (Phase 6).
