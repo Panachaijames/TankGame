@@ -1,0 +1,7 @@
+{
+  "name": "@hypertank/server",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Authoritative Colyseus game server. Implemented in Phase 6. Deploy to Railway/Render/Fly (not Vercel)."
+}

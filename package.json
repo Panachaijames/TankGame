@@ -1,0 +1,17 @@
+{
+  "name": "hypertank",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "workspaces": [
+    "shared",
+    "client",
+    "server"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace @hypertank/client",
+    "build": "npm run build --workspace @hypertank/client",
+    "preview": "npm run preview --workspace @hypertank/client",
+    "typecheck": "npm run typecheck --workspace @hypertank/client"
+  }
+}
