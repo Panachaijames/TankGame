@@ -5,6 +5,7 @@ import TopMenuBar from './components/game/TopMenuBar';
 import MainMenu from './components/screens/MainMenu';
 import ModeSelect from './components/screens/ModeSelect';
 import MatchSetup from './components/screens/MatchSetup';
+import Lobby from './components/screens/Lobby';
 import Results, { type MatchResult } from './components/screens/Results';
 import Settings from './components/overlays/Settings';
 import HowToPlay from './components/overlays/HowToPlay';
@@ -16,6 +17,7 @@ import { audioService } from './services/audioService';
 import { SettingsProvider, useSettings } from './state/SettingsContext';
 import { LeaderboardProvider } from './state/LeaderboardContext';
 import { AppShellProvider, useShell } from './state/AppShellContext';
+import { NetProvider, useNet } from './state/NetContext';
 
 const freshGameState = (difficulty: number): GameState => ({
   score: 0,
@@ -43,6 +45,8 @@ const freshGameState = (difficulty: number): GameState => ({
 const GameRoot: React.FC = () => {
   const { shell, dispatch } = useShell();
   const { settings } = useSettings();
+  const { netAdapter, registerOnStart, leave: netLeave } = useNet();
+  const [online, setOnline] = useState({ active: false, isHost: false, localId: '' });
   const [gameId, setGameId] = useState(0);
   const [gameState, setGameState] = useState<GameState>(() => ({
     ...freshGameState(1),
@@ -57,12 +61,24 @@ const GameRoot: React.FC = () => {
   const launch = useCallback(
     async (config: MatchConfig) => {
       await audioService.init();
+      setOnline({ active: false, isHost: false, localId: '' });
       setGameId((g) => g + 1);
       setGameState(freshGameState(config.options.startDifficulty));
       dispatch({ type: 'startMatch', match: config });
     },
     [dispatch],
   );
+
+  // Online: when the host starts (or a client receives 'start'), launch the match.
+  useEffect(() => {
+    registerOnStart((config, localId, isHost) => {
+      audioService.init();
+      setOnline({ active: true, isHost, localId });
+      setGameId((g) => g + 1);
+      setGameState(freshGameState(config.options.startDifficulty));
+      dispatch({ type: 'startMatch', match: config });
+    });
+  }, [registerOnStart, dispatch]);
 
   const handleGameOver = useCallback(
     (finalScore: number, finalMaxCombo: number) => {
@@ -116,9 +132,11 @@ const GameRoot: React.FC = () => {
 
   const quitToMenu = useCallback(() => {
     audioService.stop();
+    netLeave();
+    setOnline({ active: false, isHost: false, localId: '' });
     setGameState((prev) => ({ ...prev, status: 'menu' }));
     dispatch({ type: 'quitToMenu' });
-  }, [dispatch]);
+  }, [dispatch, netLeave]);
 
   // Esc toggles pause while playing; overlays handle their own Esc (capture phase).
   useEffect(() => {
@@ -141,6 +159,7 @@ const GameRoot: React.FC = () => {
       {/* Primary screens */}
       {shell.screen === 'mainMenu' && <MainMenu />}
       {shell.screen === 'modeSelect' && <ModeSelect />}
+      {shell.screen === 'lobby' && <Lobby />}
       {shell.screen === 'matchSetup' && <MatchSetup onLaunch={launch} />}
       {shell.screen === 'results' && (
         <Results result={lastResult} config={shell.match} onPlayAgain={restart} onMenu={quitToMenu} />
@@ -157,6 +176,10 @@ const GameRoot: React.FC = () => {
             status={gameState.status}
             graphicsQuality={settings.graphicsQuality}
             playerConfigs={shell.match?.players ?? []}
+            online={online.active}
+            isHost={online.isHost}
+            localPlayerId={online.localId}
+            net={netAdapter}
           />
           <HUD state={gameState} />
           <TopMenuBar config={shell.match} onPause={togglePause} />
@@ -183,7 +206,9 @@ const App: React.FC = () => (
   <SettingsProvider>
     <LeaderboardProvider>
       <AppShellProvider>
-        <GameRoot />
+        <NetProvider>
+          <GameRoot />
+        </NetProvider>
       </AppShellProvider>
     </LeaderboardProvider>
   </SettingsProvider>

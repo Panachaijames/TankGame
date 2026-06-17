@@ -23,9 +23,11 @@ import {
   type TankClass, type PlayerConfig
 } from '../types';
 import { audioService } from '../services/audioService';
-import { sampleLocalInputs } from '../input/localInput';
-import { EMPTY_INPUT } from '@hypertank/shared';
+import { sampleLocalInputs, sampleLocalInput } from '../input/localInput';
+import { EMPTY_INPUT, type PlayerInput } from '@hypertank/shared';
 import { PixiRenderer } from '../render/PixiRenderer';
+import { interpolateSnapshot } from '../net/interpolate';
+import { computeEnv, advanceTankMovement } from '../sim/movement';
 
 interface BomberSequence {
   active: boolean;
@@ -124,7 +126,22 @@ export interface WorldSnapshot {
   difficulty: number;
   screenShake: number;
   screenFlash: number;
+  // Shared HUD scalars (so online clients can show the team's score/combo/specials).
+  score: number;
+  combo: number;
+  nukeProgress: number;
+  nukeReady: boolean;
+  bomberProgress: number;
+  bomberReady: boolean;
   arena: { w: number; h: number };
+}
+
+interface NetAdapter {
+  sendInput: (input: PlayerInput) => void;
+  getRemoteInputs: () => Record<string, PlayerInput>;
+  broadcastSnapshot: (s: WorldSnapshot) => void;
+  getSnapshot: () => unknown | null;
+  getSnapshotBuffer: () => { t: number; s: unknown }[];
 }
 
 interface BattlefieldProps {
@@ -134,6 +151,10 @@ interface BattlefieldProps {
   status: GameState['status'];
   graphicsQuality: 'low' | 'medium' | 'high';
   playerConfigs: PlayerConfig[];
+  online?: boolean;
+  isHost?: boolean;
+  localPlayerId?: string;
+  net?: NetAdapter | null;
 }
 
 type PlayerEntity = Tank & {
@@ -157,7 +178,17 @@ type PlayerEntity = Tank & {
   ultSpin: number;
 };
 
-const PLAYER_COLORS = ['#38bdf8', '#fbbf24', '#22c55e', '#a855f7'];
+const PLAYER_COLORS = ['#38bdf8', '#fbbf24', '#22c55e', '#a855f7', '#fb7185'];
+
+// Distinct, far-apart multiplayer spawns. Ordered so 2 players take opposite
+// corners, then the remaining corners, then centre — never bunched together.
+const SPAWN_POINTS = [
+  { x: 180, y: 560 }, // bottom-left
+  { x: 820, y: 140 }, // top-right (opposite)
+  { x: 180, y: 140 }, // top-left
+  { x: 820, y: 560 }, // bottom-right
+  { x: 500, y: 350 }, // centre
+];
 
 const DEFAULT_CONFIGS: PlayerConfig[] = [
   { id: 'player-tank', name: 'Player 1', control: 'wasd', color: '#38bdf8', isLocal: true, tankClass: 'assault' },
@@ -166,16 +197,29 @@ const DEFAULT_CONFIGS: PlayerConfig[] = [
 /** Build a player tank for a slot, applying its class loadout, spread along the bottom edge. */
 function makePlayer(slot: number, count: number, config: PlayerConfig): PlayerEntity {
   const cls = TANK_CLASSES[config.tankClass];
-  const spacing = 150;
-  const startX = CANVAS_WIDTH / 2 - ((count - 1) * spacing) / 2 + slot * spacing;
+  // Solo spawns bottom-centre; multiplayer uses the distinct spread points so
+  // players always start in different parts of the map, never bunched up.
+  let sx: number;
+  let sy: number;
+  let facing: number;
+  if (count <= 1) {
+    sx = CANVAS_WIDTH / 2;
+    sy = CANVAS_HEIGHT - 100;
+    facing = -Math.PI / 2;
+  } else {
+    const sp = SPAWN_POINTS[slot % SPAWN_POINTS.length];
+    sx = sp.x;
+    sy = sp.y;
+    facing = Math.atan2(CANVAS_HEIGHT / 2 - sy, CANVAS_WIDTH / 2 - sx); // face the arena centre
+  }
   return {
     id: config.id || (slot === 0 ? 'player-tank' : `player-${slot}`),
-    x: startX,
-    y: CANVAS_HEIGHT - 100,
+    x: sx,
+    y: sy,
     width: cls.width,
     height: cls.height,
-    angle: -Math.PI / 2,
-    turretAngle: -Math.PI / 2,
+    angle: facing,
+    turretAngle: facing,
     health: cls.health,
     maxHealth: cls.health,
     speed: PHYSICS.MAX_SPEED,
@@ -222,7 +266,7 @@ function nearestPlayer(players: PlayerEntity[], e: { x: number; y: number }): Pl
   return best;
 }
 
-const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, difficulty, status, graphicsQuality, playerConfigs }) => {
+const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, difficulty, status, graphicsQuality, playerConfigs, online, isHost, localPlayerId, net }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const gameEndedRef = useRef(false);
   const statusRef = useRef(status);
@@ -230,6 +274,12 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
   const pixiRef = useRef<PixiRenderer | null>(null);
   const ctx2dRef = useRef<CanvasRenderingContext2D | null>(null);
   const activeCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const onlineRef = useRef(false);
+  const isHostRef = useRef(false);
+  const localIdRef = useRef('');
+  const netRef = useRef<NetAdapter | null>(null);
+  const clientHudSigRef = useRef('');
+  const predictedSelfRef = useRef<{ x: number; y: number; angle: number; turretAngle: number; velocity: { x: number; y: number } } | null>(null);
   const stateRef = useRef({
     score: 0,
     lastBossScore: 0,
@@ -325,6 +375,13 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
       stateRef.current.mouse.pressed = false;
     }
   }, [status]);
+
+  useEffect(() => {
+    onlineRef.current = !!online;
+    isHostRef.current = !!isHost;
+    localIdRef.current = localPlayerId || '';
+    netRef.current = net || null;
+  }, [online, isHost, localPlayerId, net]);
 
   const createParticles = useCallback((x: number, y: number, color: string, count: number, type: Particle['type'] = 'spark') => {
     const s = stateRef.current;
@@ -642,41 +699,24 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     // Resolve this player's controls through the shared PlayerInput seam (Phase 3).
     // Second-player and remote inputs will be injected the same way in later phases,
     // so the simulation never reads hardware (keys/mouse) directly.
-    const inputs = sampleLocalInputs(s.keys, s.mouse, s.players, s.players.length, s.enemies);
+    let inputs: PlayerInput[];
+    if (onlineRef.current && isHostRef.current && netRef.current) {
+      // Online host: the host's own tank uses local hardware; every other tank
+      // uses the latest input received from that peer.
+      const remote = netRef.current.getRemoteInputs();
+      inputs = s.players.map((p) =>
+        p.id === localIdRef.current ? sampleLocalInput(s.keys, s.mouse, p) : remote[p.id] ?? EMPTY_INPUT,
+      );
+    } else {
+      inputs = sampleLocalInputs(s.keys, s.mouse, s.players, s.players.length, s.enemies);
+    }
     // Reload, ammo regen and firing are handled per-player inside the movement loop below.
 
     if (s.screenShake > 0) s.screenShake *= 0.93;
     if (s.screenFlash > 0) s.screenFlash -= 0.04;
 
-    // Dynamic Traction/Friction calculations based on Weather or Terrain
-    let currentFriction = PHYSICS.FRICTION; // default 0.94
-    let currentAccelFactor = 1.0;
-    let currentTurnFactor = 1.0;
-
-    if (s.terrain === TerrainType.Snow) {
-      currentFriction = 0.972; // Slippery snow chassis sliding
-      currentAccelFactor = 0.8;
-      currentTurnFactor = 0.85;
-    } else if (s.terrain === TerrainType.Desert) {
-      currentFriction = 0.915; // Thick sand sink drag
-      currentAccelFactor = 0.85;
-      currentTurnFactor = 0.9;
-    }
-
-    // Weather takes major overriding influence on physics
-    if (s.weather === WeatherType.Rain) {
-      currentFriction = Math.max(currentFriction, 0.965); // Wet slippage mud
-      currentAccelFactor *= 0.78;
-      currentTurnFactor *= 0.82;
-    } else if (s.weather === WeatherType.Snowstorm) {
-      currentFriction = Math.max(currentFriction, 0.984); // Blinding blizzard black-ice slide!
-      currentAccelFactor *= 0.52; // Massive wheels track slip
-      currentTurnFactor *= 0.62; // heavy drifts
-    } else if (s.weather === WeatherType.Sandstorm) {
-      currentFriction = Math.max(currentFriction, 0.925);
-      currentAccelFactor *= 0.82;
-      // Constant westward sand wind push is applied per-player in the movement loop below.
-    }
+    // Traction from weather/terrain (shared with client-side prediction).
+    const env = computeEnv(s.weather, s.terrain);
 
     // Tread-mark helper (shared across all tanks).
     const addTreadMarkObj = (t: Tank, col: string) => {
@@ -706,17 +746,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
       const pin = inputs[pi] ?? EMPTY_INPUT;
       if (p.health <= 0) continue;
 
-      if (s.weather === WeatherType.Sandstorm) p.velocity.x -= 0.095;
-
-      p.angle += pin.turn * PHYSICS.CHASSIS_TURN_SPEED * currentTurnFactor;
-      const accel = pin.drive * PHYSICS.ACCELERATION * currentAccelFactor;
-      p.velocity.x += Math.cos(p.angle) * accel;
-      p.velocity.y += Math.sin(p.angle) * accel;
-      p.velocity.x *= currentFriction;
-      p.velocity.y *= currentFriction;
-      p.x += p.velocity.x;
-      p.y += p.velocity.y;
-
+      advanceTankMovement(p, pin, env);
       const playerSpeed = Math.hypot(p.velocity.x, p.velocity.y);
 
       if (playerSpeed > 0.45 && Math.random() < 0.65) addTreadMarkObj(p, treadMarkColor);
@@ -755,10 +785,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
         }
       }
 
-      let turretDiff = pin.aim - p.turretAngle;
-      while (turretDiff < -Math.PI) turretDiff += Math.PI * 2;
-      while (turretDiff > Math.PI) turretDiff -= Math.PI * 2;
-      p.turretAngle += Math.max(-PHYSICS.TURRET_TURN_SPEED, Math.min(PHYSICS.TURRET_TURN_SPEED, turretDiff));
+      // (chassis + turret movement handled by advanceTankMovement above)
 
       // Per-player reload countdown.
       if (p.isCooldown) {
@@ -1591,6 +1618,12 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
       difficulty: cs.difficulty,
       screenShake: cs.screenShake,
       screenFlash: cs.screenFlash,
+      score: cs.score,
+      combo: cs.combo,
+      nukeProgress: Math.min(100, (cs.nukeCounter / NUKE_TARGET) * 100),
+      nukeReady: cs.nukeCounter >= NUKE_TARGET,
+      bomberProgress: Math.min(100, (cs.bomberCounter / BOMBER_TARGET) * 100),
+      bomberReady: cs.bomberCounter >= BOMBER_TARGET,
       arena: { w: CANVAS_WIDTH, h: CANVAS_HEIGHT },
     };
   }, []);
@@ -1840,12 +1873,107 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
   useEffect(() => {
     let lastTime = performance.now();
     let rafId = 0;
+    let broadcastAccum = 0;
     const loop = (time: number) => {
       const d = Math.min(time - lastTime, 100); lastTime = time;
-      update(d);
-      const snap = buildSnapshot();
-      if (pixiRef.current) pixiRef.current.render(snap);
-      else if (ctx2dRef.current) draw(ctx2dRef.current, snap);
+      const adapter = netRef.current;
+
+      if (onlineRef.current && !isHostRef.current) {
+        // CLIENT: render the host's world interpolated ~100ms behind, send input,
+        // and drive our own HUD from the snapshot's local player.
+        const snap = adapter
+          ? interpolateSnapshot(adapter.getSnapshotBuffer() as { t: number; s: unknown }[], localIdRef.current, 100)
+          : null;
+        if (snap) {
+          // Freshest authoritative state of our own tank (for prediction + reconcile).
+          let authMe: { x: number; y: number; angle: number; turretAngle: number } | null = null;
+          if (adapter) {
+            const buf = adapter.getSnapshotBuffer() as { t: number; s: { players?: any[] } }[];
+            authMe = (buf[buf.length - 1]?.s?.players || []).find((p: any) => p.id === localIdRef.current) || null;
+          }
+
+          // Predict OUR tank locally so it responds instantly (others stay interpolated).
+          let input: PlayerInput = EMPTY_INPUT;
+          if (statusRef.current === 'playing') {
+            if (!predictedSelfRef.current && authMe) {
+              predictedSelfRef.current = { x: authMe.x, y: authMe.y, angle: authMe.angle, turretAngle: authMe.turretAngle, velocity: { x: 0, y: 0 } };
+            }
+            const pred = predictedSelfRef.current;
+            if (pred) {
+              input = sampleLocalInput(stateRef.current.keys, stateRef.current.mouse, pred);
+              advanceTankMovement(pred, input, computeEnv(snap.weather, snap.terrain));
+              pred.x = Math.max(30, Math.min(CANVAS_WIDTH - 30, pred.x));
+              pred.y = Math.max(30, Math.min(CANVAS_HEIGHT - 30, pred.y));
+              if (authMe) {
+                const errDist = Math.hypot(authMe.x - pred.x, authMe.y - pred.y);
+                if (errDist > 150) {
+                  // Large divergence (teleport / heavy knockback) → snap to authority.
+                  pred.x = authMe.x;
+                  pred.y = authMe.y;
+                  pred.velocity.x = 0;
+                  pred.velocity.y = 0;
+                } else {
+                  // Gentle reconciliation toward the host's authoritative position.
+                  pred.x += (authMe.x - pred.x) * 0.12;
+                  pred.y += (authMe.y - pred.y) * 0.12;
+                }
+              }
+              const meTank = snap.players.find((pl) => pl.id === localIdRef.current);
+              if (meTank) {
+                meTank.x = pred.x;
+                meTank.y = pred.y;
+                meTank.angle = pred.angle;
+                meTank.turretAngle = pred.turretAngle;
+              }
+            }
+          }
+
+          if (pixiRef.current) pixiRef.current.render(snap);
+          else if (ctx2dRef.current) draw(ctx2dRef.current, snap);
+
+          if (adapter && statusRef.current === 'playing') {
+            adapter.sendInput(input);
+            const me = snap.players.find((pl) => pl.id === localIdRef.current);
+            if (me) {
+              const sig = `${me.ammo}|${me.reloading}|${me.energy}|${me.ultReady}|${snap.score}|${snap.combo}|${snap.difficulty}|${snap.weather}|${snap.nukeReady}|${snap.bomberReady}`;
+              if (sig !== clientHudSigRef.current) {
+                clientHudSigRef.current = sig;
+                onStateUpdate({
+                  ammo: me.ammo ?? 0,
+                  maxAmmo: me.maxAmmo ?? 1,
+                  isCooldown: !!me.reloading,
+                  energy: me.energy ?? 0,
+                  maxEnergy: me.maxEnergy ?? 100,
+                  ultReady: !!me.ultReady,
+                  ultName: ULTIMATES[me.tankClass ?? 'assault'].label,
+                  score: snap.score,
+                  combo: snap.combo,
+                  difficulty: snap.difficulty,
+                  weather: snap.weather,
+                  terrain: snap.terrain,
+                  nukeReady: snap.nukeReady,
+                  nukeProgress: snap.nukeProgress,
+                  bomberReady: snap.bomberReady,
+                  bomberProgress: snap.bomberProgress,
+                });
+              }
+            }
+          }
+        }
+      } else {
+        // SOLO / LOCAL-2P / HOST: run the sim and render it.
+        update(d);
+        const snap = buildSnapshot();
+        if (pixiRef.current) pixiRef.current.render(snap);
+        else if (ctx2dRef.current) draw(ctx2dRef.current, snap);
+        if (onlineRef.current && isHostRef.current && adapter) {
+          broadcastAccum += d;
+          if (broadcastAccum >= 50) {
+            broadcastAccum = 0;
+            adapter.broadcastSnapshot(snap);
+          }
+        }
+      }
       rafId = requestAnimationFrame(loop);
     };
     rafId = requestAnimationFrame(loop);

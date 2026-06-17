@@ -1,6 +1,23 @@
-import type { MatchConfig, SessionKind, MatchMode, TankClass } from '../types';
+import type { MatchConfig, SessionKind, MatchMode, TankClass, PlayerConfig } from '../types';
 
-export const PLAYER_COLORS = ['#38bdf8', '#fbbf24', '#22c55e', '#a855f7'];
+export const PLAYER_COLORS = ['#38bdf8', '#fbbf24', '#22c55e', '#a855f7', '#fb7185'];
+
+/** Build the shared online MatchConfig from a lobby roster. The same config is
+ *  used by every peer; each peer decides which player is "local" via its own id. */
+export function createOnlineMatchConfig(
+  roster: { id: string; name: string; tankClass: TankClass }[],
+  mode: MatchMode = 'coop',
+): MatchConfig {
+  const players: PlayerConfig[] = roster.map((p, i) => ({
+    id: p.id,
+    name: p.name,
+    control: 'remote',
+    color: PLAYER_COLORS[i % PLAYER_COLORS.length],
+    isLocal: false,
+    tankClass: p.tankClass,
+  }));
+  return { session: 'online', mode, players, options: { startDifficulty: 1 } };
+}
 
 /**
  * Build the MatchConfig handed to the simulation. The shape is N-player-ready;

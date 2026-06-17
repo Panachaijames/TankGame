@@ -31,10 +31,10 @@ const OPTIONS: SessionOption[] = [
   {
     kind: 'online',
     title: 'ONLINE',
-    blurb: 'Battle friends over the net with room codes. Co-op and versus.',
+    blurb: 'Play with friends over the net via room codes. Co-op vs AI.',
     icon: '🌐',
-    enabled: false,
-    note: 'PHASE 6',
+    enabled: true,
+    note: 'BETA',
   },
 ];
 
@@ -42,6 +42,10 @@ export const ModeSelect: React.FC = () => {
   const { dispatch } = useShell();
 
   const pick = (kind: SessionKind) => {
+    if (kind === 'online') {
+      dispatch({ type: 'navigate', screen: 'lobby' });
+      return;
+    }
     const config = createMatchConfig(kind, 'coop');
     dispatch({ type: 'setMatch', match: config });
     dispatch({ type: 'navigate', screen: 'matchSetup' });
