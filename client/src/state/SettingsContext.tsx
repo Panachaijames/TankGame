@@ -24,6 +24,7 @@ export const DEFAULT_SETTINGS: Settings = {
   graphicsQuality: 'high',
   reduceMotion: prefersReducedMotion || false,
   screenShake: true,
+  movementMode: 'direct',
   version: 1,
 };
 

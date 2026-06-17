@@ -1,7 +1,7 @@
 import React, { createContext, useContext, useRef, useState, useCallback, useMemo } from 'react';
 import type { TankClass, MatchConfig } from '../types';
 import type { PlayerInput } from '@hypertank/shared';
-import type { WorldSnapshot } from '../components/Battlefield';
+import type { WorldSnapshot, GameOverResult } from '../components/Battlefield';
 import { NetSession, type NetRole, type NetMsg } from '../net/connection';
 import { serializeSnapshot } from '../net/serialize';
 import type { TimedSnap } from '../net/interpolate';
@@ -42,6 +42,9 @@ export interface NetAdapter {
   broadcastSnapshot: (s: WorldSnapshot) => void; // host → clients
   getSnapshot: () => unknown | null; // client reads latest wire snapshot
   getSnapshotBuffer: () => TimedSnap[]; // client reads timed buffer for interpolation
+  broadcastGameOver: (r: GameOverResult) => void; // host → clients (round end)
+  getGameOver: () => GameOverResult | null; // client reads received result
+  getConnectedIds: () => string[]; // host: ids still connected (self + live peers)
 }
 
 interface NetContextValue {
@@ -64,6 +67,7 @@ export const NetProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const remoteInputsRef = useRef<Record<string, PlayerInput>>({});
   const snapshotRef = useRef<unknown | null>(null);
   const snapshotBufferRef = useRef<TimedSnap[]>([]);
+  const gameOverRef = useRef<GameOverResult | null>(null);
   const onStartRef = useRef<((config: MatchConfig, localId: string, isHost: boolean) => void) | null>(null);
   const [net, setNet] = useState<NetState>(INITIAL);
 
@@ -133,6 +137,8 @@ export const NetProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         if (buf.length > 24) buf.shift();
       } else if (msg.t === 'start') {
         onStartRef.current?.(msg.config as MatchConfig, sessionRef.current!.selfId, false);
+      } else if (msg.t === 'gameover') {
+        gameOverRef.current = msg.r as GameOverResult;
       }
     };
     try {
@@ -165,6 +171,8 @@ export const NetProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     if (!s) return;
     remoteInputsRef.current = {};
     snapshotRef.current = null;
+    gameOverRef.current = null;
+    snapshotBufferRef.current = [];
     s.broadcast({ t: 'start', config });
     onStartRef.current?.(config, s.selfId, true);
   }, []);
@@ -183,6 +191,12 @@ export const NetProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       broadcastSnapshot: (s) => sessionRef.current?.broadcast({ t: 'snapshot', s: serializeSnapshot(s) }),
       getSnapshot: () => snapshotRef.current,
       getSnapshotBuffer: () => snapshotBufferRef.current,
+      broadcastGameOver: (r) => sessionRef.current?.broadcast({ t: 'gameover', r }),
+      getGameOver: () => gameOverRef.current,
+      getConnectedIds: () => {
+        const s = sessionRef.current;
+        return s ? [s.selfId, ...s.peerIds()] : [];
+      },
     }),
     [],
   );
@@ -194,6 +208,7 @@ export const NetProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     remoteInputsRef.current = {};
     snapshotRef.current = null;
     snapshotBufferRef.current = [];
+    gameOverRef.current = null;
     setNet(INITIAL);
   }, []);
 

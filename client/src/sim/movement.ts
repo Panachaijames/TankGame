@@ -48,6 +48,9 @@ interface Movable {
 interface MoveInput {
   drive: number;
   turn: number;
+  moveX: number;
+  moveY: number;
+  direct: boolean;
   aim: number;
 }
 
@@ -59,14 +62,40 @@ interface MoveInput {
  */
 export function advanceTankMovement(p: Movable, input: MoveInput, env: MoveEnv): void {
   if (env.sandstorm) p.velocity.x -= 0.095;
-  p.angle += input.turn * PHYSICS.CHASSIS_TURN_SPEED * env.turn;
-  const a = input.drive * PHYSICS.ACCELERATION * env.accel;
-  p.velocity.x += Math.cos(p.angle) * a;
-  p.velocity.y += Math.sin(p.angle) * a;
+
+  if (input.direct) {
+    // Direct / twin-stick: accelerate toward the screen-space move vector; the
+    // hull eases to face the travel direction (turret aims independently).
+    let mx = input.moveX;
+    let my = input.moveY;
+    const mag = Math.hypot(mx, my);
+    if (mag > 0) {
+      mx /= mag;
+      my /= mag;
+    }
+    const a = PHYSICS.ACCELERATION * env.accel * 1.4; // a touch snappier than tank mode
+    p.velocity.x += mx * a;
+    p.velocity.y += my * a;
+    if (mag > 0.01) {
+      const target = Math.atan2(my, mx);
+      let d = target - p.angle;
+      while (d < -Math.PI) d += Math.PI * 2;
+      while (d > Math.PI) d -= Math.PI * 2;
+      p.angle += d * 0.3; // smooth turn-to-face
+    }
+  } else {
+    // Tank: rotate the hull, thrust along its facing.
+    p.angle += input.turn * PHYSICS.CHASSIS_TURN_SPEED * env.turn;
+    const a = input.drive * PHYSICS.ACCELERATION * env.accel;
+    p.velocity.x += Math.cos(p.angle) * a;
+    p.velocity.y += Math.sin(p.angle) * a;
+  }
+
   p.velocity.x *= env.friction;
   p.velocity.y *= env.friction;
   p.x += p.velocity.x;
   p.y += p.velocity.y;
+
   let td = input.aim - p.turretAngle;
   while (td < -Math.PI) td += Math.PI * 2;
   while (td > Math.PI) td -= Math.PI * 2;

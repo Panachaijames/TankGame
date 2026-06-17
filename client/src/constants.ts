@@ -4,6 +4,10 @@ import { EnemyType, TerrainType, PowerUpType } from './types';
 export const CANVAS_WIDTH = 1000;
 export const CANVAS_HEIGHT = 700;
 
+// Online battle-royale world (the viewport stays CANVAS_WIDTH×HEIGHT; a follow
+// camera scrolls around this larger world). Solo / local-2P keep the small arena.
+export const BIG_WORLD = { w: 5000, h: 3500 };
+
 export const PHYSICS = {
   ACCELERATION: 0.25, // Slightly more responsive
   FRICTION: 0.94,

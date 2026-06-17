@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { useShell } from '../../state/AppShellContext';
 import { useNet } from '../../state/NetContext';
 import { createOnlineMatchConfig } from '../../state/matchConfig';
-import type { TankClass } from '../../types';
+import type { TankClass, MatchMode } from '../../types';
 import { TANK_CLASSES } from '../../constants';
 import Button from '../ui/Button';
 import Panel from '../ui/Panel';
@@ -23,6 +23,7 @@ export const Lobby: React.FC = () => {
   });
   const [code, setCode] = useState('');
   const [cls, setCls] = useState<TankClass>('assault');
+  const [mode, setMode] = useState<MatchMode>('versus'); // battle-royale by default
 
   const persistName = (n: string) => {
     setName(n);
@@ -66,7 +67,7 @@ export const Lobby: React.FC = () => {
     return (
       <div className="absolute inset-0 z-20 flex flex-col items-center justify-center px-6 text-white animate-fade-in">
         <h2 className="mb-2 font-orbitron text-4xl font-bold text-sky-400">ONLINE</h2>
-        <p className="mb-6 font-sans text-slate-400">Play with friends over the net (co-op vs AI).</p>
+        <p className="mb-6 font-sans text-slate-400">Battle royale or co-op over the net · the host picks the mode.</p>
 
         {net.phase === 'error' && (
           <div className="mb-4 rounded-lg border border-red-500/40 bg-red-500/10 px-4 py-2 text-sm text-red-300">
@@ -175,6 +176,44 @@ export const Lobby: React.FC = () => {
           <span className="mb-1 block text-xs uppercase tracking-widest text-slate-400">Change your class</span>
           <ClassRow value={cls} onPick={(c) => { setCls(c); setSelfClass(c); }} />
         </div>
+
+        {isHost && (
+          <div className="mt-5">
+            <span className="mb-1 block text-xs uppercase tracking-widest text-slate-400">Game mode</span>
+            <div className="grid grid-cols-2 gap-2">
+              {(
+                [
+                  ['versus', 'VERSUS', 'Battle royale · last tank standing', false],
+                  ['coop', 'CO-OP', 'Team vs AI — online soon', true],
+                ] as const
+              ).map(([m, label, desc, disabled]) => (
+                <button
+                  key={m}
+                  disabled={disabled}
+                  onClick={() => !disabled && setMode(m)}
+                  className={`rounded-lg border p-2 text-left transition ${
+                    disabled
+                      ? 'cursor-not-allowed border-slate-800 bg-slate-900/40 opacity-50'
+                      : mode === m
+                        ? 'border-sky-500 bg-sky-500/10'
+                        : 'border-slate-700 bg-slate-800/40 hover:border-slate-500'
+                  }`}
+                >
+                  <div className="font-orbitron text-xs font-bold text-white">
+                    {label}
+                    {disabled && <span className="ml-1 text-[8px] text-amber-400">SOON</span>}
+                  </div>
+                  <div className="text-[10px] leading-tight text-slate-400">{desc}</div>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+        {!isHost && (
+          <p className="mt-4 text-center text-[11px] uppercase tracking-widest text-slate-500">
+            Host picks the mode
+          </p>
+        )}
       </Panel>
 
       <div className="mt-6 flex items-center gap-3">
@@ -182,14 +221,16 @@ export const Lobby: React.FC = () => {
           ← LEAVE
         </Button>
         {isHost ? (
-          <Button size="lg" onClick={() => startMatch(createOnlineMatchConfig(net.players))}>
+          <Button size="lg" onClick={() => startMatch(createOnlineMatchConfig(net.players, mode))}>
             START ▸
           </Button>
         ) : (
           <span className="font-orbitron text-sm text-slate-400">Waiting for host…</span>
         )}
       </div>
-      <p className="mt-4 text-xs text-slate-600">Co-op vs AI · the host runs the match · {net.players.length}/{5} pilots.</p>
+      <p className="mt-4 text-xs text-slate-600">
+        {mode === 'versus' ? 'Versus · huge map · last tank standing' : 'Co-op vs AI'} · the host runs the match · {net.players.length}/{5} pilots.
+      </p>
     </div>
   );
 };

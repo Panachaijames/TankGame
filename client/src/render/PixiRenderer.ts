@@ -4,8 +4,13 @@ import { EnemyType, WeatherType, TerrainType, type Tank } from '../types';
 import { TANK_CLASSES } from '../constants';
 import type { WorldSnapshot } from '../components/Battlefield';
 import { makeRingTexture, makeSoftCircleTexture } from './textures';
+import { cameraOffset } from '../sim/camera';
 
 export type Quality = 'low' | 'medium' | 'high';
+
+// The viewport (canvas) size — the window onto the (possibly larger) world.
+const VIEW_W = 1000;
+const VIEW_H = 700;
 
 interface TankView {
   container: Container;
@@ -64,6 +69,11 @@ export class PixiRenderer {
   private weatherSprite!: Sprite;
   private flash!: Graphics;
   private textLayer!: Container;
+  private minimap!: Graphics;
+
+  // Current follow-camera offset (world coords of the viewport's top-left).
+  private camX = 0;
+  private camY = 0;
 
   private ringTex!: Texture;
   private dotTex!: Texture;
@@ -124,9 +134,11 @@ export class PixiRenderer {
     this.world.addChild(this.fx);
 
     if (this.quality !== 'low') this.fx.filters = [this.makeBloom(this.quality)];
-    // Pin the bloom filter region to the arena so off-screen beams/bullets can't
-    // blow up the filter texture bounds (Pixi crashes on degenerate/huge areas).
-    this.fx.filterArea = new Rectangle(0, 0, 1000, 700);
+    // Pin the bloom filter region (avoids Pixi crashing on the huge off-screen
+    // beam bounds). filterArea is in the fx layer's LOCAL (world) space and the
+    // fx layer is scrolled by the camera, so this rectangle is re-anchored to the
+    // visible viewport every frame in render(). The margin covers screen-shake.
+    this.fx.filterArea = new Rectangle(-120, -120, VIEW_W + 240, VIEW_H + 240);
 
     this.overlay = new Container();
     stage.addChild(this.overlay);
@@ -155,6 +167,10 @@ export class PixiRenderer {
 
     this.textLayer = new Container();
     this.overlay.addChild(this.textLayer);
+
+    // Corner minimap (only shown on the big battle-royale world).
+    this.minimap = new Graphics();
+    this.overlay.addChild(this.minimap);
   }
 
   private makeBloom(q: Quality): AdvancedBloomFilter {
@@ -178,14 +194,29 @@ export class PixiRenderer {
     if (!this.ready || !this.app) return;
     this.time++;
 
+    // Follow camera: centre the local tank on the big world (a no-op {0,0} on
+    // the small arena). The world container scrolls; shake rides on top.
+    const target = snap.player ?? snap.players[0];
+    const cam = target
+      ? cameraOffset(target.x, target.y, snap.arena.w, snap.arena.h)
+      : { x: 0, y: 0 };
+    this.camX = cam.x;
+    this.camY = cam.y;
+    // Re-anchor the bloom region to the visible viewport (filterArea is in the
+    // fx layer's local/world space, which the camera scrolls by -cam).
+    if (this.fx.filterArea) {
+      this.fx.filterArea.x = cam.x - 120;
+      this.fx.filterArea.y = cam.y - 120;
+    }
+    let shx = 0;
+    let shy = 0;
     if (snap.screenShake > 0.1) {
       const sh = Math.min(snap.screenShake, 30);
-      this.world.x = (Math.random() - 0.5) * sh;
-      this.world.y = (Math.random() - 0.5) * sh;
-    } else {
-      this.world.x = 0;
-      this.world.y = 0;
+      shx = (Math.random() - 0.5) * sh;
+      shy = (Math.random() - 0.5) * sh;
     }
+    this.world.x = -cam.x + shx;
+    this.world.y = -cam.y + shy;
 
     this.drawBackground(snap);
     this.drawDecals(snap);
@@ -197,10 +228,11 @@ export class PixiRenderer {
     this.drawParticles(snap);
     this.drawWeather(snap);
     this.drawFloatingText(snap);
+    this.drawMinimap(snap);
 
     this.flash.clear();
     if (snap.screenFlash > 0) {
-      this.flash.rect(0, 0, snap.arena.w, snap.arena.h).fill({ color: 0xffffff, alpha: snap.screenFlash });
+      this.flash.rect(0, 0, VIEW_W, VIEW_H).fill({ color: 0xffffff, alpha: snap.screenFlash });
     }
 
     this.app.render();
@@ -235,8 +267,11 @@ export class PixiRenderer {
     // Neon arena border.
     g.roundRect(3, 3, w - 6, h - 6, 14).stroke({ width: 2, color: t.accent, alpha: 0.35 });
 
-    // Tint the soft ground glow to the biome accent.
+    // Tint the soft ground glow to the biome accent; keep it under the player
+    // (on the big world it would otherwise sit far away at the world origin).
     this.groundGlow.tint = t.accent;
+    const tgt = snap.player ?? snap.players[0];
+    if (tgt) this.groundGlow.position.set(tgt.x, tgt.y);
 
     this.lastTerrain = snap.terrain;
   }
@@ -475,12 +510,13 @@ export class PixiRenderer {
       this.weatherSprite.visible = false;
       return;
     }
-    // Full-screen colour grade for mood.
-    this.weatherTint.rect(0, 0, snap.arena.w, snap.arena.h).fill({ color: cfg.tint, alpha: 0.2 });
-    // Softened radial vision limit centred on the local player.
-    const p = snap.player;
+    // Full-screen colour grade for mood (overlay is screen-space → viewport-sized).
+    this.weatherTint.rect(0, 0, VIEW_W, VIEW_H).fill({ color: cfg.tint, alpha: 0.2 });
+    // Softened radial vision limit centred on the local player. The overlay is
+    // screen-space, so place it at the player's on-screen position (world − cam).
+    const p = snap.player ?? snap.players[0];
     this.weatherSprite.visible = true;
-    this.weatherSprite.position.set(p.x, p.y);
+    this.weatherSprite.position.set(p.x - this.camX, p.y - this.camY);
     this.weatherSprite.scale.set((cfg.rad * 1.3) / 128);
     this.weatherSprite.tint = cfg.tint;
     this.weatherSprite.alpha = cfg.alpha * 0.72;
@@ -504,10 +540,50 @@ export class PixiRenderer {
       txt.text = ft.text;
       txt.style.fontSize = ft.size;
       txt.style.fill = ft.color;
-      txt.position.set(ft.x, ft.y);
+      // World-space position → on-screen (overlay isn't camera-translated).
+      txt.position.set(ft.x - this.camX, ft.y - this.camY);
       txt.alpha = ft.opacity;
     }
     for (let i = list.length; i < this.textPool.length; i++) this.textPool[i].visible = false;
+  }
+
+  private drawMinimap(snap: WorldSnapshot) {
+    const g = this.minimap;
+    g.clear();
+    const ww = snap.arena.w;
+    const wh = snap.arena.h;
+    // Small arena (solo / local-2P) fits the whole screen — no minimap needed.
+    if (ww <= VIEW_W && wh <= VIEW_H) {
+      g.visible = false;
+      return;
+    }
+    g.visible = true;
+    const mmW = 176;
+    const mmH = Math.round(mmW * (wh / ww)); // preserve world aspect ratio
+    const mx = VIEW_W - mmW - 16;
+    const my = VIEW_H - mmH - 16;
+    const sx = mmW / ww;
+    const sy = mmH / wh;
+
+    // Panel.
+    g.roundRect(mx - 5, my - 5, mmW + 10, mmH + 10, 8)
+      .fill({ color: 0x05070d, alpha: 0.66 })
+      .stroke({ width: 1.5, color: 0x38bdf8, alpha: 0.4 });
+
+    // Current viewport rectangle (what the camera shows right now).
+    g.rect(mx + this.camX * sx, my + this.camY * sy, VIEW_W * sx, VIEW_H * sy)
+      .stroke({ width: 1, color: 0xe2e8f0, alpha: 0.4 });
+
+    // Player blips (local player gets a white ring).
+    const localId = (snap.player ?? snap.players[0])?.id;
+    for (const p of snap.players) {
+      if (p.health <= 0) continue;
+      const px = mx + p.x * sx;
+      const py = my + p.y * sy;
+      const me = p.id === localId;
+      g.circle(px, py, me ? 4.5 : 3).fill({ color: p.color, alpha: 1 });
+      if (me) g.circle(px, py, 7.5).stroke({ width: 1.5, color: 0xffffff, alpha: 0.9 });
+    }
   }
 
   destroy() {

@@ -184,6 +184,7 @@ export interface Settings {
   graphicsQuality: GraphicsQuality;
   reduceMotion: boolean;
   screenShake: boolean;
+  movementMode: 'direct' | 'tank';
   version: number;
 }
 

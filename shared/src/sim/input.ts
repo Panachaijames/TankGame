@@ -5,8 +5,11 @@
  * 2P, gamepads, and online play all share one engine.
  */
 export interface PlayerInput {
-  drive: number; // -1..1  (forward / reverse)
-  turn: number; // -1..1   (rotate chassis)
+  drive: number; // -1..1  (tank mode: forward / reverse)
+  turn: number; // -1..1   (tank mode: rotate chassis)
+  moveX: number; // -1..1  (direct mode: screen-space move vector)
+  moveY: number; // -1..1
+  direct: boolean; // true = direct/twin-stick movement, false = tank controls
   aim: number; // absolute turret target angle in radians (world space)
   fire: boolean;
   reload: boolean;
@@ -18,6 +21,9 @@ export interface PlayerInput {
 export const EMPTY_INPUT: PlayerInput = {
   drive: 0,
   turn: 0,
+  moveX: 0,
+  moveY: 0,
+  direct: false,
   aim: 0,
   fire: false,
   reload: false,

@@ -3,6 +3,7 @@ import React, { useRef, useEffect, useCallback } from 'react';
 import {
   CANVAS_WIDTH,
   CANVAS_HEIGHT,
+  BIG_WORLD,
   PLAYER_DEFAULTS,
   ENEMY_CONFIGS,
   DIFFICULTY_INTERVAL,
@@ -28,6 +29,7 @@ import { EMPTY_INPUT, type PlayerInput } from '@hypertank/shared';
 import { PixiRenderer } from '../render/PixiRenderer';
 import { interpolateSnapshot } from '../net/interpolate';
 import { computeEnv, advanceTankMovement } from '../sim/movement';
+import { cameraOffset } from '../sim/camera';
 
 interface BomberSequence {
   active: boolean;
@@ -79,6 +81,7 @@ interface SpecializedBullet extends Bullet {
   wobbleOffset?: number;
   wobbleSpeed?: number;
   isPersistent?: boolean;
+  ownerId?: string; // who fired it (versus: bullets skip their owner, damage others)
 }
 
 /**
@@ -136,16 +139,25 @@ export interface WorldSnapshot {
   arena: { w: number; h: number };
 }
 
+export interface GameOverResult {
+  winnerId: string;
+  score: number;
+  maxCombo: number;
+}
+
 interface NetAdapter {
   sendInput: (input: PlayerInput) => void;
   getRemoteInputs: () => Record<string, PlayerInput>;
   broadcastSnapshot: (s: WorldSnapshot) => void;
   getSnapshot: () => unknown | null;
   getSnapshotBuffer: () => { t: number; s: unknown }[];
+  broadcastGameOver: (r: GameOverResult) => void; // host → clients (versus round end)
+  getGameOver: () => GameOverResult | null; // client reads received result
+  getConnectedIds: () => string[]; // host: ids still connected (self + live peers)
 }
 
 interface BattlefieldProps {
-  onGameOver: (score: number, maxCombo: number) => void;
+  onGameOver: (score: number, maxCombo: number, outcome?: 'victory' | 'defeat' | 'draw') => void;
   onStateUpdate: (updates: Partial<GameState>) => void;
   difficulty: number;
   status: GameState['status'];
@@ -155,6 +167,8 @@ interface BattlefieldProps {
   isHost?: boolean;
   localPlayerId?: string;
   net?: NetAdapter | null;
+  directControls?: boolean;
+  matchMode?: 'coop' | 'versus';
 }
 
 type PlayerEntity = Tank & {
@@ -190,21 +204,44 @@ const SPAWN_POINTS = [
   { x: 500, y: 350 }, // centre
 ];
 
+// Battle-royale spawns as fractions of the big world — spread to the far edges
+// so players start thousands of units apart, out of each other's view (a whole
+// viewport is only ~1000×700 of the world). Order keeps any two players opposite.
+const BIG_SPAWN_FRACS = [
+  [0.12, 0.18], // far top-left
+  [0.88, 0.84], // far bottom-right (opposite)
+  [0.86, 0.16], // far top-right
+  [0.14, 0.85], // far bottom-left
+  [0.5, 0.5], // centre
+];
+
 const DEFAULT_CONFIGS: PlayerConfig[] = [
   { id: 'player-tank', name: 'Player 1', control: 'wasd', color: '#38bdf8', isLocal: true, tankClass: 'assault' },
 ];
 
-/** Build a player tank for a slot, applying its class loadout, spread along the bottom edge. */
-function makePlayer(slot: number, count: number, config: PlayerConfig): PlayerEntity {
+/** Build a player tank for a slot, applying its class loadout, at a spawn point. */
+function makePlayer(
+  slot: number,
+  count: number,
+  config: PlayerConfig,
+  worldW: number = CANVAS_WIDTH,
+  worldH: number = CANVAS_HEIGHT,
+): PlayerEntity {
   const cls = TANK_CLASSES[config.tankClass];
-  // Solo spawns bottom-centre; multiplayer uses the distinct spread points so
-  // players always start in different parts of the map, never bunched up.
+  // Big world (online): spread to far corners, out of sight. Small world: solo
+  // spawns bottom-centre, local-2P uses the distinct corner spread points.
   let sx: number;
   let sy: number;
   let facing: number;
-  if (count <= 1) {
-    sx = CANVAS_WIDTH / 2;
-    sy = CANVAS_HEIGHT - 100;
+  const big = worldW > CANVAS_WIDTH;
+  if (big) {
+    const f = BIG_SPAWN_FRACS[slot % BIG_SPAWN_FRACS.length];
+    sx = f[0] * worldW;
+    sy = f[1] * worldH;
+    facing = Math.atan2(worldH / 2 - sy, worldW / 2 - sx); // face the world centre
+  } else if (count <= 1) {
+    sx = worldW / 2;
+    sy = worldH - 100;
     facing = -Math.PI / 2;
   } else {
     const sp = SPAWN_POINTS[slot % SPAWN_POINTS.length];
@@ -266,7 +303,7 @@ function nearestPlayer(players: PlayerEntity[], e: { x: number; y: number }): Pl
   return best;
 }
 
-const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, difficulty, status, graphicsQuality, playerConfigs, online, isHost, localPlayerId, net }) => {
+const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, difficulty, status, graphicsQuality, playerConfigs, online, isHost, localPlayerId, net, directControls, matchMode }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const gameEndedRef = useRef(false);
   const statusRef = useRef(status);
@@ -278,9 +315,18 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
   const isHostRef = useRef(false);
   const localIdRef = useRef('');
   const netRef = useRef<NetAdapter | null>(null);
+  const directRef = useRef(false);
+  const versusRef = useRef(false);
   const clientHudSigRef = useRef('');
   const predictedSelfRef = useRef<{ x: number; y: number; angle: number; turretAngle: number; velocity: { x: number; y: number } } | null>(null);
+  // Online plays on the big battle-royale world with a follow camera; solo /
+  // local-2P keep the single-screen arena. Stable for the life of this match
+  // (the component is keyed by gameId, so it remounts per match).
+  const WORLD_W = online ? BIG_WORLD.w : CANVAS_WIDTH;
+  const WORLD_H = online ? BIG_WORLD.h : CANVAS_HEIGHT;
   const stateRef = useRef({
+    worldW: WORLD_W,
+    worldH: WORLD_H,
     score: 0,
     lastBossScore: 0,
     combo: 0,
@@ -291,7 +337,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     screenShake: 0,
     screenFlash: 0,
     players: (playerConfigs.length > 0 ? playerConfigs : DEFAULT_CONFIGS).map(
-      (cfg, i, arr) => makePlayer(i, arr.length, cfg),
+      (cfg, i, arr) => makePlayer(i, arr.length, cfg, WORLD_W, WORLD_H),
     ) as PlayerEntity[],
     enemies: [] as Tank[],
     bullets: [] as SpecializedBullet[],
@@ -342,6 +388,15 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     stateRef.current.mouse.y = (e.clientY - rect.top) * (CANVAS_HEIGHT / rect.height);
   };
 
+  // The mouse is stored in viewport (0..1000) space; on the big world the turret
+  // aims at a WORLD point, so add the follow-camera offset for the tank we're
+  // controlling. On the small arena the camera offset is {0,0} (a no-op).
+  const worldMouseFor = (p: { x: number; y: number }) => {
+    const s = stateRef.current;
+    const cam = cameraOffset(p.x, p.y, s.worldW, s.worldH);
+    return { x: s.mouse.x + cam.x, y: s.mouse.y + cam.y, pressed: s.mouse.pressed, rightPressed: s.mouse.rightPressed };
+  };
+
   const handleMouseDown = (e: React.MouseEvent) => {
     if (e.button === 0) stateRef.current.mouse.pressed = true;
     if (e.button === 2) stateRef.current.mouse.rightPressed = true;
@@ -381,7 +436,9 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     isHostRef.current = !!isHost;
     localIdRef.current = localPlayerId || '';
     netRef.current = net || null;
-  }, [online, isHost, localPlayerId, net]);
+    directRef.current = !!directControls;
+    versusRef.current = matchMode === 'versus';
+  }, [online, isHost, localPlayerId, net, directControls, matchMode]);
 
   const createParticles = useCallback((x: number, y: number, color: string, count: number, type: Particle['type'] = 'spark') => {
     const s = stateRef.current;
@@ -433,6 +490,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
       isSuperBullet: false,
       isExplosive: false,
       isAllied: isPlayer,
+      ownerId: tank.id,
       radius: isBoss ? 12 : 8,
       history: [],
       trailHistory: []
@@ -453,12 +511,15 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
   const fireAutoSwarm = useCallback((count: number, source?: PlayerEntity) => {
     const s = stateRef.current;
     const src = source ?? s.players[0];
-    const targets = [...s.enemies];
+    // Versus: swarm hunts the other tanks; co-op: hunts AI enemies.
+    const targets = versusRef.current
+      ? s.players.filter((p) => p.id !== src.id && p.health > 0)
+      : [...s.enemies];
 
     for (let i = 0; i < count; i++) {
         const sideOffset = (i % 2 === 0 ? 1 : -1) * (Math.PI / 1.5);
         const launchAngle = src.angle + sideOffset + (Math.random() - 0.5) * 0.4;
-        const target = targets[i % targets.length];
+        const target = targets.length ? targets[i % targets.length] : undefined;
 
         s.bullets.push({
             id: `swarm-${Math.random().toString(36).substring(2, 10)}`,
@@ -475,6 +536,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
             isSuperBullet: false,
             isExplosive: true,
             isAllied: true,
+            ownerId: src.id,
             radius: 10,
             history: [],
             trailHistory: [],
@@ -494,7 +556,84 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     s.screenShake = Math.max(s.screenShake, 25);
   }, []);
 
+  // ── Versus (PvP) damage helpers — no-ops in co-op (friendly fire off) ──────
+  /** Damage every living player within `radius` of (x,y), excluding the given id(s). */
+  const damagePlayersRadius = useCallback((x: number, y: number, radius: number, dmg: number, except?: string | string[]) => {
+    if (!versusRef.current) return;
+    const s = stateRef.current;
+    const skip = Array.isArray(except) ? except : except != null ? [except] : [];
+    for (const p of s.players) {
+      if (p.health <= 0 || skip.includes(p.id)) continue;
+      if (Math.hypot(p.x - x, p.y - y) < radius) {
+        p.health -= dmg;
+        createParticles(p.x, p.y, p.color, 10, 'spark');
+      }
+    }
+  }, [createParticles]);
+
+  /** Damage every OTHER living player whose centre lies near a hitscan ray. */
+  const damagePlayersRay = useCallback(
+    (ox: number, oy: number, dirx: number, diry: number, range: number, perpPad: number, dmg: number, exceptId?: string) => {
+      if (!versusRef.current) return;
+      const s = stateRef.current;
+      for (const p of s.players) {
+        if (p.health <= 0 || p.id === exceptId) continue;
+        const relx = p.x - ox;
+        const rely = p.y - oy;
+        const t = relx * dirx + rely * diry;
+        if (t < 0 || t > range) continue;
+        const perp = Math.abs(relx * diry - rely * dirx);
+        if (perp < p.width / 2 + perpPad) {
+          p.health -= dmg;
+          createParticles(p.x, p.y, p.color, 12, 'spark');
+        }
+      }
+    },
+    [createParticles],
+  );
+
+  /** End the match (once). Versus winner = last tank standing; co-op = all down. */
+  const endMatch = useCallback((winnerId: string) => {
+    if (gameEndedRef.current) return;
+    gameEndedRef.current = true;
+    const s = stateRef.current;
+    if (onlineRef.current && isHostRef.current && netRef.current) {
+      netRef.current.broadcastGameOver({ winnerId, score: s.score, maxCombo: s.maxCombo });
+    }
+    const outcome = versusRef.current
+      ? !winnerId
+        ? 'draw'
+        : winnerId === localIdRef.current
+          ? 'victory'
+          : 'defeat'
+      : undefined;
+    onGameOver(s.score, s.maxCombo, outcome);
+  }, [onGameOver]);
+
+  /** Win-condition check, run after damage each frame. */
+  const checkGameOver = useCallback(() => {
+    if (gameEndedRef.current) return;
+    const s = stateRef.current;
+    // Online host: a pilot who disconnected mid-round is eliminated (otherwise an
+    // idle full-health ghost would keep the alive count up and hang the match).
+    if (onlineRef.current && isHostRef.current && netRef.current) {
+      const connected = new Set(netRef.current.getConnectedIds());
+      for (const p of s.players) {
+        if (p.health > 0 && p.id !== localIdRef.current && !connected.has(p.id)) p.health = 0;
+      }
+    }
+    const alive = s.players.filter((p) => p.health > 0);
+    if (versusRef.current) {
+      // Last tank standing — only a real result with 2+ pilots.
+      if (s.players.length >= 2 && alive.length <= 1) endMatch(alive[0]?.id ?? '');
+    } else if (alive.length === 0) {
+      endMatch('');
+    }
+  }, [endMatch]);
+
   const requestSpawn = useCallback((type: EnemyType) => {
+    // Online is pure battle-royale PvP for now — no AI waves. (Solo / local keep them.)
+    if (onlineRef.current) return;
     const s = stateRef.current;
     let x, y, angle;
     const side = Math.floor(Math.random() * 4);
@@ -603,7 +742,9 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
         for (let j = i + 1; j < tanks.length; j++) {
             const tA = tanks[i];
             const tB = tanks[j];
-            
+            // Dead tanks (versus corpses) aren't solid — don't push/trap the living.
+            if (tA.health <= 0 || tB.health <= 0) continue;
+
             // Approximate collision radius (using 85% of width for a tighter circular feel)
             const radiusA = (tA.width * 0.85) / 2;
             const radiusB = (tB.width * 0.85) / 2;
@@ -705,10 +846,10 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
       // uses the latest input received from that peer.
       const remote = netRef.current.getRemoteInputs();
       inputs = s.players.map((p) =>
-        p.id === localIdRef.current ? sampleLocalInput(s.keys, s.mouse, p) : remote[p.id] ?? EMPTY_INPUT,
+        p.id === localIdRef.current ? sampleLocalInput(s.keys, worldMouseFor(p), p, directRef.current) : remote[p.id] ?? EMPTY_INPUT,
       );
     } else {
-      inputs = sampleLocalInputs(s.keys, s.mouse, s.players, s.players.length, s.enemies);
+      inputs = sampleLocalInputs(s.keys, s.mouse, s.players, s.players.length, s.enemies, directRef.current);
     }
     // Reload, ammo regen and firing are handled per-player inside the movement loop below.
 
@@ -827,6 +968,8 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
               if (e.health <= 0) onEnemyKill(e);
             }
           });
+          // Versus: the railgun beam pierces other players too.
+          damagePlayersRay(ox, oy, dirx, diry, LASER_RANGE, 8, p.damage, p.id);
           s.beams.push({
             x1: ox,
             y1: oy,
@@ -864,7 +1007,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
             dx: Math.cos(a) * 16, dy: Math.sin(a) * 16,
             damage: 22, color: p.color,
             isHighPowered: false, isSuperBullet: false, isExplosive: false,
-            isAllied: true, radius: 7, history: [], trailHistory: [],
+            isAllied: true, ownerId: p.id, radius: 7, history: [], trailHistory: [],
           });
         }
       }
@@ -884,6 +1027,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
           s.enemies.forEach((e) => {
             if (Math.hypot(e.x - p.x, e.y - p.y) < 320) { e.health -= 80; if (e.health <= 0) onEnemyKill(e); }
           });
+          damagePlayersRadius(p.x, p.y, 320, 80, p.id); // versus: nova hits other tanks
           s.screenFlash = Math.max(s.screenFlash, 0.6);
           s.screenShake = Math.max(s.screenShake, 60);
         } else if (p.tankClass === 'vanguard') {
@@ -908,6 +1052,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
               if (e.health <= 0) onEnemyKill(e);
             }
           });
+          damagePlayersRay(p.x, p.y, dirx, diry, LASER_RANGE, 45, 400, p.id); // versus: lance vaporises tanks
           s.beams.push({ x1: p.x, y1: p.y, x2: p.x + dirx * LASER_RANGE, y2: p.y + diry * LASER_RANGE, color: '#ffffff', life: 22, maxLife: 22, width: 42 });
           s.screenFlash = Math.max(s.screenFlash, 1.0);
           s.screenShake = Math.max(s.screenShake, 120);
@@ -1032,8 +1177,8 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
 
     // Bound Checks after collision resolution
     for (const p of s.players) {
-      p.x = Math.max(30, Math.min(CANVAS_WIDTH - 30, p.x));
-      p.y = Math.max(30, Math.min(CANVAS_HEIGHT - 30, p.y));
+      p.x = Math.max(30, Math.min(s.worldW - 30, p.x));
+      p.y = Math.max(30, Math.min(s.worldH - 30, p.y));
     }
 
     const bToRemove = new Set<string>();
@@ -1066,9 +1211,13 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
           }
           if (b.phase === 'homing') {
               b.currentSpeed = Math.min(b.maxSpeed!, b.currentSpeed! + 0.45);
-              if (!b.targetId || !s.enemies.find(e => e.id === b.targetId)) {
+              // Versus: missiles hunt other tanks; co-op: AI enemies.
+              const homingPool: Tank[] = versusRef.current
+                ? s.players.filter((p) => p.id !== b.ownerId && p.health > 0)
+                : s.enemies;
+              if (!b.targetId || !homingPool.find(e => e.id === b.targetId)) {
                   let nearest = null; let minDist = Infinity;
-                  s.enemies.forEach(e => {
+                  homingPool.forEach(e => {
                       const d = Math.hypot(e.x - b.x, e.y - b.y);
                       if (d < minDist) { minDist = d; nearest = e; }
                   });
@@ -1084,7 +1233,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
                       b.angle += Math.max(-b.turnSpeed!, Math.min(b.turnSpeed!, angleDiff));
                   }
               }
-              const target = s.enemies.find(e => e.id === b.targetId);
+              const target = homingPool.find(e => e.id === b.targetId);
               if (target) {
                   const targetAngle = Math.atan2(target.y - b.y, target.x - b.x);
                   let angleDiff = targetAngle - b.angle;
@@ -1103,6 +1252,24 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
       if (b.trailHistory.length > 25) b.trailHistory.shift();
 
       if (b.isAllied) {
+        // Versus: a player's bullet damages OTHER players (never its owner).
+        if (versusRef.current) {
+          for (const p of s.players) {
+            if (p.health <= 0 || p.id === b.ownerId) continue;
+            if (Math.hypot(b.x - p.x, b.y - p.y) < p.width / 2 + b.radius) {
+              p.health -= b.damage; bToRemove.add(b.id);
+              audioService.playHit();
+              createParticles(b.x, b.y, p.color, 14, 'spark');
+              if (b.isExplosive) {
+                s.explosions.push({ x: b.x, y: b.y, radius: 5, maxRadius: 150, opacity: 1, fadeSpeed: 0.07, color: '#f97316' });
+                // Splash hits OTHERS only — the direct victim already took the full hit.
+                damagePlayersRadius(b.x, b.y, 150, b.damage * 0.5, [b.ownerId ?? '', p.id]);
+              }
+              break;
+            }
+          }
+          if (bToRemove.has(b.id)) return; // consumed by a PvP hit
+        }
         s.enemies.forEach(e => {
           if (Math.hypot(b.x - e.x, b.y - e.y) < e.width/2 + b.radius) {
             e.health -= b.damage; bToRemove.add(b.id);
@@ -1121,7 +1288,6 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
             p.health -= b.damage; bToRemove.add(b.id);
             audioService.playHit();
             s.screenShake = Math.max(s.screenShake, b.damage * 1.5 + 10);
-            if (s.players.every((pl) => pl.health <= 0)) { gameEndedRef.current = true; onGameOver(s.score, s.maxCombo); }
             break;
           }
         }
@@ -1131,7 +1297,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     s.bullets = s.bullets.filter(b => {
         if (bToRemove.has(b.id)) return false;
         if (b.isPersistent) return true;
-        return b.x > -300 && b.x < CANVAS_WIDTH + 300 && b.y > -300 && b.y < CANVAS_HEIGHT + 300;
+        return b.x > -300 && b.x < s.worldW + 300 && b.y > -300 && b.y < s.worldH + 300;
     });
     
     s.enemies = s.enemies.filter(e => e.health > 0);
@@ -1236,8 +1402,9 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
       onStateUpdate({ weather: s.weather, terrain: s.terrain });
     }
 
-    // Dynamic environmental weather emissions
-    if (s.weather === WeatherType.Rain) {
+    // Dynamic environmental weather emissions (skipped online: particles aren't
+    // networked and the small-arena emit ranges don't cover the big world).
+    if (!onlineRef.current && s.weather === WeatherType.Rain) {
       for (let i = 0; i < 5; i++) {
         s.particles.push({
           x: Math.random() * CANVAS_WIDTH,
@@ -1251,7 +1418,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
           type: 'rain'
         });
       }
-    } else if (s.weather === WeatherType.Sandstorm) {
+    } else if (!onlineRef.current && s.weather === WeatherType.Sandstorm) {
       for (let i = 0; i < 6; i++) {
         s.particles.push({
           x: CANVAS_WIDTH + 10,
@@ -1265,7 +1432,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
           type: 'sand'
         });
       }
-    } else if (s.weather === WeatherType.Fog) {
+    } else if (!onlineRef.current && s.weather === WeatherType.Fog) {
       if (Math.random() < 0.12) {
         s.particles.push({
           x: -50,
@@ -1279,7 +1446,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
           type: 'smoke'
         });
       }
-    } else if (s.weather === WeatherType.Snowstorm) {
+    } else if (!onlineRef.current && s.weather === WeatherType.Snowstorm) {
       // Blinding snowstorm thick particle generator
       for (let i = 0; i < 6; i++) {
         s.particles.push({
@@ -1314,6 +1481,9 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
 
     if (s.combo > 0 && Date.now() - s.lastComboTime > COMBO_TIMEOUT) { s.combo = 0; onStateUpdate({ combo: 0 }); }
 
+    // Win condition (co-op: all down · versus: last tank standing).
+    checkGameOver();
+
     // Report player 1's ammo/reload to the HUD only when it changes.
     const p0 = s.players[0];
     if (
@@ -1339,7 +1509,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
         ultName: ULTIMATES[p0.tankClass].label,
       });
     }
-  }, [onStateUpdate, status, onGameOver, spawnSpecificEnemy, fireBullet, onEnemyKill, initiateReload, createParticles, fireAutoSwarm, requestSpawn, resolveTankCollisions]);
+  }, [onStateUpdate, status, onGameOver, spawnSpecificEnemy, fireBullet, onEnemyKill, initiateReload, createParticles, fireAutoSwarm, requestSpawn, resolveTankCollisions, checkGameOver, damagePlayersRadius, damagePlayersRay]);
 
   const drawTank = (ctx: CanvasRenderingContext2D, t: Tank) => {
     ctx.save(); ctx.translate(t.x, t.y);
@@ -1624,7 +1794,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
       nukeReady: cs.nukeCounter >= NUKE_TARGET,
       bomberProgress: Math.min(100, (cs.bomberCounter / BOMBER_TARGET) * 100),
       bomberReady: cs.bomberCounter >= BOMBER_TARGET,
-      arena: { w: CANVAS_WIDTH, h: CANVAS_HEIGHT },
+      arena: { w: cs.worldW, h: cs.worldH },
     };
   }, []);
 
@@ -1879,6 +2049,22 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
       const adapter = netRef.current;
 
       if (onlineRef.current && !isHostRef.current) {
+        // Synced game-over: the host decides the round is over and broadcasts the
+        // result; the client transitions to its own win/lose screen.
+        if (!gameEndedRef.current && adapter) {
+          const go = adapter.getGameOver();
+          if (go) {
+            gameEndedRef.current = true;
+            const outcome = versusRef.current
+              ? !go.winnerId
+                ? 'draw'
+                : go.winnerId === localIdRef.current
+                  ? 'victory'
+                  : 'defeat'
+              : undefined;
+            onGameOver(go.score, go.maxCombo, outcome);
+          }
+        }
         // CLIENT: render the host's world interpolated ~100ms behind, send input,
         // and drive our own HUD from the snapshot's local player.
         const snap = adapter
@@ -1900,10 +2086,10 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
             }
             const pred = predictedSelfRef.current;
             if (pred) {
-              input = sampleLocalInput(stateRef.current.keys, stateRef.current.mouse, pred);
+              input = sampleLocalInput(stateRef.current.keys, worldMouseFor(pred), pred, directRef.current);
               advanceTankMovement(pred, input, computeEnv(snap.weather, snap.terrain));
-              pred.x = Math.max(30, Math.min(CANVAS_WIDTH - 30, pred.x));
-              pred.y = Math.max(30, Math.min(CANVAS_HEIGHT - 30, pred.y));
+              pred.x = Math.max(30, Math.min(stateRef.current.worldW - 30, pred.x));
+              pred.y = Math.max(30, Math.min(stateRef.current.worldH - 30, pred.y));
               if (authMe) {
                 const errDist = Math.hypot(authMe.x - pred.x, authMe.y - pred.y);
                 if (errDist > 150) {

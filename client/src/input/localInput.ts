@@ -33,16 +33,20 @@ export function sampleKeyboardInput(
   map: KeyMap,
   aim: number,
   fire: boolean,
+  direct = false,
 ): PlayerInput {
-  let drive = 0;
-  let turn = 0;
-  if (anyDown(keys, map.up)) drive += 1;
-  if (anyDown(keys, map.down)) drive -= 0.85;
-  if (anyDown(keys, map.left)) turn -= 1;
-  if (anyDown(keys, map.right)) turn += 1;
+  const up = anyDown(keys, map.up);
+  const down = anyDown(keys, map.down);
+  const left = anyDown(keys, map.left);
+  const right = anyDown(keys, map.right);
   return {
-    drive,
-    turn,
+    // Tank-mode interpretation:
+    drive: (up ? 1 : 0) + (down ? -0.85 : 0),
+    turn: (right ? 1 : 0) + (left ? -1 : 0),
+    // Direct-mode interpretation (screen-space):
+    moveX: (right ? 1 : 0) - (left ? 1 : 0),
+    moveY: (down ? 1 : 0) - (up ? 1 : 0),
+    direct,
     aim,
     fire,
     reload: anyDown(keys, map.reload),
@@ -57,9 +61,10 @@ export function sampleLocalInput(
   keys: Record<string, boolean>,
   mouse: { x: number; y: number; pressed: boolean },
   player: { x: number; y: number },
+  direct = false,
 ): PlayerInput {
   const aim = Math.atan2(mouse.y - player.y, mouse.x - player.x);
-  return sampleKeyboardInput(keys, P1_KEYS, aim, mouse.pressed);
+  return sampleKeyboardInput(keys, P1_KEYS, aim, mouse.pressed, direct);
 }
 
 // ── Local multiplayer input slots ──────────────────────────────────────────
@@ -117,7 +122,7 @@ function firstGamepad(): Gamepad | null {
 
 const dz = (v: number) => (Math.abs(v) < 0.18 ? 0 : v);
 
-function sampleGamepadInput(pad: Gamepad, pose: Pose): PlayerInput {
+function sampleGamepadInput(pad: Gamepad, pose: Pose, direct = false): PlayerInput {
   const lx = dz(pad.axes[0] ?? 0);
   const ly = dz(pad.axes[1] ?? 0);
   const rx = dz(pad.axes[2] ?? 0);
@@ -126,6 +131,9 @@ function sampleGamepadInput(pad: Gamepad, pose: Pose): PlayerInput {
   return {
     drive: Math.max(-1, Math.min(1, -ly)),
     turn: Math.max(-1, Math.min(1, lx)),
+    moveX: Math.max(-1, Math.min(1, lx)),
+    moveY: Math.max(-1, Math.min(1, ly)),
+    direct,
     aim: Math.hypot(rx, ry) > 0.25 ? Math.atan2(ry, rx) : pose.turretAngle,
     fire: b(7) || b(0),
     reload: b(2),
@@ -146,12 +154,13 @@ export function sampleLocalInputs(
   players: Pose[],
   count: number,
   enemies: { x: number; y: number }[],
+  direct = false,
 ): PlayerInput[] {
   const inputs: PlayerInput[] = [];
   const p1 = players[0];
   const p1map = count >= 2 ? P1_KEYS_2P : P1_KEYS;
   inputs.push(
-    sampleKeyboardInput(keys, p1map, p1 ? Math.atan2(mouse.y - p1.y, mouse.x - p1.x) : 0, mouse.pressed),
+    sampleKeyboardInput(keys, p1map, p1 ? Math.atan2(mouse.y - p1.y, mouse.x - p1.x) : 0, mouse.pressed, direct),
   );
   for (let i = 1; i < count; i++) {
     const p = players[i];
@@ -161,9 +170,9 @@ export function sampleLocalInputs(
     }
     const pad = i === 1 ? firstGamepad() : null;
     if (pad) {
-      inputs.push(sampleGamepadInput(pad, p));
+      inputs.push(sampleGamepadInput(pad, p, direct));
     } else {
-      inputs.push(sampleKeyboardInput(keys, P2_KEYS, nearestEnemyAngle(p, enemies), P2_FIRE.some((k) => keys[k])));
+      inputs.push(sampleKeyboardInput(keys, P2_KEYS, nearestEnemyAngle(p, enemies), P2_FIRE.some((k) => keys[k]), direct));
     }
   }
   return inputs;

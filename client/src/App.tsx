@@ -18,6 +18,7 @@ import { SettingsProvider, useSettings } from './state/SettingsContext';
 import { LeaderboardProvider } from './state/LeaderboardContext';
 import { AppShellProvider, useShell } from './state/AppShellContext';
 import { NetProvider, useNet } from './state/NetContext';
+import { createOnlineMatchConfig } from './state/matchConfig';
 
 const freshGameState = (difficulty: number): GameState => ({
   score: 0,
@@ -45,7 +46,7 @@ const freshGameState = (difficulty: number): GameState => ({
 const GameRoot: React.FC = () => {
   const { shell, dispatch } = useShell();
   const { settings } = useSettings();
-  const { netAdapter, registerOnStart, leave: netLeave } = useNet();
+  const { netAdapter, registerOnStart, leave: netLeave, startMatch: netStartMatch, net } = useNet();
   const [online, setOnline] = useState({ active: false, isHost: false, localId: '' });
   const [gameId, setGameId] = useState(0);
   const [gameState, setGameState] = useState<GameState>(() => ({
@@ -81,11 +82,12 @@ const GameRoot: React.FC = () => {
   }, [registerOnStart, dispatch]);
 
   const handleGameOver = useCallback(
-    (finalScore: number, finalMaxCombo: number) => {
+    (finalScore: number, finalMaxCombo: number, outcome?: 'victory' | 'defeat' | 'draw') => {
       setLastResult({
         score: finalScore,
         maxCombo: finalMaxCombo,
         difficulty: gsRef.current.difficulty,
+        outcome,
       });
       setGameState((prev) => ({
         ...prev,
@@ -127,8 +129,17 @@ const GameRoot: React.FC = () => {
   }, [dispatch]);
 
   const restart = useCallback(() => {
+    // Online host: re-broadcast a fresh start so every connected pilot rematches
+    // (the offline launch() path would drop the connection + run a broken solo).
+    if (online.active) {
+      if (online.isHost) {
+        netStartMatch(createOnlineMatchConfig(net.players, shell.match?.mode ?? 'versus'));
+      }
+      // Non-host clients can't force a rematch; they wait for the host (PLAY AGAIN hidden).
+      return;
+    }
     if (shell.match) launch(shell.match);
-  }, [shell.match, launch]);
+  }, [online, netStartMatch, net.players, shell.match, launch]);
 
   const quitToMenu = useCallback(() => {
     audioService.stop();
@@ -162,7 +173,7 @@ const GameRoot: React.FC = () => {
       {shell.screen === 'lobby' && <Lobby />}
       {shell.screen === 'matchSetup' && <MatchSetup onLaunch={launch} />}
       {shell.screen === 'results' && (
-        <Results result={lastResult} config={shell.match} onPlayAgain={restart} onMenu={quitToMenu} />
+        <Results result={lastResult} config={shell.match} onPlayAgain={restart} onMenu={quitToMenu} hidePlayAgain={online.active && !online.isHost} />
       )}
 
       {/* Live match */}
@@ -180,6 +191,8 @@ const GameRoot: React.FC = () => {
             isHost={online.isHost}
             localPlayerId={online.localId}
             net={netAdapter}
+            directControls={settings.movementMode === 'direct'}
+            matchMode={shell.match?.mode ?? 'coop'}
           />
           <HUD state={gameState} />
           <TopMenuBar config={shell.match} onPause={togglePause} />

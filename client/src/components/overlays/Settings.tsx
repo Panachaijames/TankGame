@@ -18,14 +18,21 @@ const QUALITIES: { id: GraphicsQuality; label: string }[] = [
   { id: 'high', label: 'HIGH' },
 ];
 
-const CONTROLS: { keys: string[]; action: string }[] = [
-  { keys: ['W', 'A', 'S', 'D'], action: 'Drive chassis' },
+type Row = { keys: string[]; action: string };
+const COMMON_CONTROLS: Row[] = [
   { keys: ['MOUSE'], action: 'Aim turret' },
   { keys: ['CLICK'], action: 'Fire' },
+  { keys: ['E'], action: 'Ultimate (when charged)' },
   { keys: ['R'], action: 'Reload' },
   { keys: ['Q'], action: 'Nuke (when charged)' },
   { keys: ['F'], action: 'Air strike (when charged)' },
   { keys: ['ESC'], action: 'Pause' },
+];
+const DIRECT_CONTROLS: Row[] = [{ keys: ['W', 'A', 'S', 'D'], action: 'Move (screen directions)' }, ...COMMON_CONTROLS];
+const TANK_CONTROLS: Row[] = [
+  { keys: ['W', 'S'], action: 'Drive forward / reverse' },
+  { keys: ['A', 'D'], action: 'Rotate hull' },
+  ...COMMON_CONTROLS,
 ];
 
 export const Settings: React.FC<SettingsProps> = ({ onClose }) => {
@@ -126,21 +133,47 @@ export const Settings: React.FC<SettingsProps> = ({ onClose }) => {
       )}
 
       {tab === 'controls' && (
-        <div className="space-y-2">
-          {CONTROLS.map((c) => (
-            <div
-              key={c.action}
-              className="flex items-center justify-between border-b border-slate-800/60 py-2"
-            >
-              <span className="text-slate-300">{c.action}</span>
-              <span className="flex gap-1">
-                {c.keys.map((k) => (
-                  <KeyCap key={k}>{k}</KeyCap>
-                ))}
-              </span>
+        <div className="space-y-4">
+          <div>
+            <div className="mb-2 text-sm text-slate-300">Movement style</div>
+            <div className="grid grid-cols-2 gap-2">
+              {(
+                [
+                  ['direct', 'DIRECT', 'WASD moves; mouse aims (smooth)'],
+                  ['tank', 'TANK', 'A/D rotate hull, W/S drive'],
+                ] as const
+              ).map(([m, label, desc]) => (
+                <button
+                  key={m}
+                  onClick={() => setSetting('movementMode', m)}
+                  className={`rounded-lg border p-3 text-left transition ${
+                    settings.movementMode === m
+                      ? 'border-sky-500 bg-sky-500/10'
+                      : 'border-slate-700 bg-slate-800/40 hover:border-slate-500'
+                  }`}
+                >
+                  <div className="font-orbitron text-sm font-bold text-white">{label}</div>
+                  <div className="text-[10px] leading-tight text-slate-400">{desc}</div>
+                </button>
+              ))}
             </div>
-          ))}
-          <p className="pt-3 text-xs text-slate-500">Custom key rebinding arrives with local 2P (Phase 5).</p>
+          </div>
+
+          <div className="space-y-1">
+            {(settings.movementMode === 'tank' ? TANK_CONTROLS : DIRECT_CONTROLS).map((c) => (
+              <div key={c.action} className="flex items-center justify-between border-b border-slate-800/60 py-1.5">
+                <span className="text-sm text-slate-300">{c.action}</span>
+                <span className="flex gap-1">
+                  {c.keys.map((k) => (
+                    <KeyCap key={k}>{k}</KeyCap>
+                  ))}
+                </span>
+              </div>
+            ))}
+          </div>
+          <p className="pt-1 text-xs text-slate-500">
+            Movement style applies immediately. Full per-key rebinding is on the roadmap.
+          </p>
         </div>
       )}
     </Modal>
