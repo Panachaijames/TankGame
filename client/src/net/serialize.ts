@@ -77,6 +77,7 @@ export function serializeSnapshot(s: WorldSnapshot): unknown {
     arena: s.arena,
     obstacles: s.obstacles.map((o) => ({ id: o.id, x: o.x, y: o.y, w: o.w, h: o.h, kind: o.kind, health: r(o.health), maxHealth: o.maxHealth })),
     fireAlerts: s.fireAlerts.map((a) => ({ x: r(a.x), y: r(a.y), ownerId: a.ownerId, life: a.life, maxLife: a.maxLife })),
+    hazards: s.hazards,
     storm: s.storm
       ? {
           active: s.storm.active,
@@ -124,6 +125,7 @@ export function deserializeSnapshot(data: any, localId: string): WorldSnapshot {
     arena: data.arena || { w: 1000, h: 700 },
     obstacles: data.obstacles || [],
     fireAlerts: data.fireAlerts || [],
+    hazards: data.hazards || [],
     storm: data.storm,
   } as WorldSnapshot;
 }

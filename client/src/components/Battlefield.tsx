@@ -6,6 +6,7 @@ import {
   BIG_WORLD,
   PLAYER_DEFAULTS,
   ENEMY_CONFIGS,
+  BOSS_TYPES,
   DIFFICULTY_INTERVAL,
   COMBO_TIMEOUT,
   PHYSICS,
@@ -123,6 +124,19 @@ export interface Obstacle {
   maxHealth: number;
 }
 
+// Ground hazards: artillery strike warnings (then splash) + Sapper proximity mines.
+export interface Hazard {
+  id: string;
+  kind: 'strike' | 'mine';
+  x: number;
+  y: number;
+  timer: number; // strike: frames to impact · mine: frames to arm
+  maxTimer: number;
+  radius: number;
+  damage: number;
+  armed?: boolean;
+}
+
 // A gunshot "noise" ping: where a player fired. Nearby enemies see it as an
 // on-screen ring or an off-screen edge marker (positional audio, visualised).
 export interface FireAlert {
@@ -163,6 +177,7 @@ export interface WorldSnapshot {
   storm?: StormSnapshot;
   obstacles: Obstacle[];
   fireAlerts: FireAlert[];
+  hazards: Hazard[];
 }
 
 // ION STORM — the shrinking PvP safe-zone (versus). `cx/cy/radius` is the live
@@ -384,6 +399,22 @@ function makePlayer(
   };
 }
 
+// Hard ceiling on live enemies (perf — summoner bosses + waves can't flood).
+const MAX_ENEMIES = 70;
+
+// Base fire/ability cadence (ms) per archetype, scaled by difficulty at spawn.
+const ARCH_FIRE_MS: Record<string, number> = {
+  chaser: 1400, scout: 800, heavy: 2000, rammer: 999999, shotgun: 1700, burst: 1900,
+  orbiter: 1000, charger: 2200, sniper: 2600, artillery: 2400, spinner: 240,
+  homing: 1800, mine: 1400, shield: 1800, splitter: 1600, healer: 2500,
+  teleporter: 3200, summoner: 2600,
+};
+
+/** Enemy config lookup + handy archetype/boss checks. */
+const enemyCfg = (e: { enemyType?: EnemyType }) => (e.enemyType ? ENEMY_CONFIGS[e.enemyType] : undefined);
+const isBossE = (e: { enemyType?: EnemyType }) => !!enemyCfg(e)?.isBoss;
+const archOf = (e: { enemyType?: EnemyType }) => enemyCfg(e)?.archetype;
+
 /** Nearest living player to a point (enemy AI target). Falls back to slot 0. */
 function nearestPlayer(players: PlayerEntity[], e: { x: number; y: number }): PlayerEntity {
   let best = players[0];
@@ -431,6 +462,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     worldH: WORLD_H,
     obstacles: makeObstacles(WORLD_W, WORLD_H, online ? 46 : 10),
     fireAlerts: [] as FireAlert[],
+    hazards: [] as Hazard[],
     storm: {
       active: online && matchMode === 'versus',
       cx: stormCx,
@@ -454,7 +486,8 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     combo: 0,
     maxCombo: 0,
     lastComboTime: 0,
-    difficulty: 1,
+    difficulty: Math.max(1, difficulty || 1), // honour the chosen RECRUIT/VETERAN/ELITE start
+
     killCount: 0,
     screenShake: 0,
     screenFlash: 0,
@@ -592,10 +625,12 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     if (pe && (pe.isCooldown || pe.ammo <= 0)) return;
 
     const angle = customAngle ?? tank.turretAngle;
-    const isBoss = tank.enemyType === EnemyType.Boss;
-    const speed = pe ? pe.bulletSpeed : isBoss ? 4.5 : 4;
-    const dmg = pe ? pe.damage : isBoss ? 35 : 15;
-    const col = pe ? tank.color : isBoss ? '#a855f7' : '#ef4444';
+    const isBoss = isBossE(tank);
+    const ecfg = pe ? null : enemyCfg(tank);
+    const arch = ecfg?.archetype;
+    const speed = pe ? pe.bulletSpeed : arch === 'sniper' ? 11 : isBoss ? 5 : 4.5;
+    const dmg = pe ? pe.damage : ecfg?.damage ?? 15;
+    const col = pe ? tank.color : ecfg?.color ?? '#ef4444';
 
     s.bullets.push({
       id: Math.random().toString(36).substring(2, 10),
@@ -821,6 +856,8 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
   const requestSpawn = useCallback((type: EnemyType) => {
     // Online is pure battle-royale PvP for now — no AI waves. (Solo / local keep them.)
     if (onlineRef.current) return;
+    // Respect the enemy cap (bosses always allowed); count pending indicators too.
+    if (!ENEMY_CONFIGS[type].isBoss && stateRef.current.enemies.length + stateRef.current.spawnIndicators.length >= MAX_ENEMIES) return;
     const s = stateRef.current;
     let x, y, angle;
     const side = Math.floor(Math.random() * 4);
@@ -851,8 +888,9 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
       maxHealth: config.health * (1 + (stateRef.current.difficulty - 1) * 0.15),
       speed: config.speed, velocity: { x: 0, y: 0 }, color: config.color,
       isShielded: false, shootTimer: 0,
-      shootInterval: type === EnemyType.Boss ? 1500 : 2500 / Math.max(1, stateRef.current.difficulty * 0.8),
-      type: 'enemy', enemyType: type, recoilOffset: 0
+      shootInterval: (ARCH_FIRE_MS[config.archetype] ?? 1600) / (1 + (stateRef.current.difficulty - 1) * 0.06),
+      type: 'enemy', enemyType: type, recoilOffset: 0,
+      aiTimer: 0, aiPhase: 0, aiBurst: 0, orbitDir: Math.random() < 0.5 ? 1 : -1,
     });
   }, []);
 
@@ -896,21 +934,30 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
       });
     }
 
-    if (e.enemyType === EnemyType.Boss) {
+    const boss = config.isBoss;
+    if (boss) {
       s.screenShake = Math.max(s.screenShake, 80);
     } else {
       s.screenShake = Math.max(s.screenShake, 10 + Math.min(s.combo / 2, 40));
     }
     audioService.playCombo(s.combo);
-    
-    s.explosions.push({ 
-      x: e.x, y: e.y, 
-      radius: 5, 
-      maxRadius: e.enemyType === EnemyType.Boss ? 500 : 100, 
-      opacity: 1, fadeSpeed: e.enemyType === EnemyType.Boss ? 0.005 : 0.03, 
-      color: e.enemyType === EnemyType.Boss ? '#7e22ce' : '#ea580c' 
+
+    s.explosions.push({
+      x: e.x, y: e.y,
+      radius: 5,
+      maxRadius: boss ? 500 : 100,
+      opacity: 1, fadeSpeed: boss ? 0.005 : 0.03,
+      color: boss ? config.color : '#ea580c'
     });
     audioService.playExplosion();
+
+    // Splitter: rupture into offspring scattered outward from the corpse.
+    if (config.archetype === 'splitter' && config.childKey && s.enemies.length < MAX_ENEMIES) {
+      for (let i = 0; i < 2; i++) {
+        const a = Math.random() * Math.PI * 2;
+        spawnSpecificEnemy(config.childKey, e.x + Math.cos(a) * 26, e.y + Math.sin(a) * 26);
+      }
+    }
     
     onStateUpdate({ 
       score: s.score, combo: s.combo, maxCombo: s.maxCombo, 
@@ -919,7 +966,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
       bomberReady: s.bomberCounter >= BOMBER_TARGET,
       bomberProgress: Math.min(100, (s.bomberCounter / BOMBER_TARGET) * 100)
     });
-  }, [onStateUpdate, fireAutoSwarm]);
+  }, [onStateUpdate, fireAutoSwarm, spawnSpecificEnemy]);
 
   const resolveTankCollisions = useCallback(() => {
     const s = stateRef.current;
@@ -946,16 +993,17 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
                 const nx = dx / dist;
                 const ny = dy / dist;
 
-                // Kamikaze contact explosion
+                // Rammer (kamikaze) contact explosion
                 let kamikazeExploded = false;
-                if ((tA.type === 'player' && tB.enemyType === EnemyType.Kamikaze) ||
-                    (tB.type === 'player' && tA.enemyType === EnemyType.Kamikaze)) {
-                    
-                    const kamikaze = tA.enemyType === EnemyType.Kamikaze ? tA : tB;
+                const ramA = archOf(tA) === 'rammer';
+                const ramB = archOf(tB) === 'rammer';
+                if ((tA.type === 'player' && ramB) || (tB.type === 'player' && ramA)) {
+
+                    const kamikaze = ramA ? tA : tB;
                     const player = tA.type === 'player' ? tA : tB;
-                    
+
                     if (kamikaze.health > 0 && player.health > 0) {
-                        player.health -= 30; // Kamikaze config damage
+                        player.health -= enemyCfg(kamikaze)?.damage ?? 30;
                         kamikaze.health = 0; // Trigger death
                         
                         audioService.playHit();
@@ -990,8 +1038,8 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
                 let weightA = 1;
                 let weightB = 1;
                 
-                if (tA.enemyType === EnemyType.Boss) weightA = 0.1;
-                if (tB.enemyType === EnemyType.Boss) weightB = 0.1;
+                if (isBossE(tA)) weightA = 0.1;
+                if (isBossE(tB)) weightB = 0.1;
                 if (tA.type === 'player') weightA = 0.5;
                 if (tB.type === 'player') weightB = 0.5;
 
@@ -1259,7 +1307,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
 
     if (s.score - s.lastBossScore >= BOSS_SCORE_THRESHOLD) {
       s.lastBossScore = s.score;
-      requestSpawn(EnemyType.Boss);
+      requestSpawn(BOSS_TYPES[Math.floor(Math.random() * BOSS_TYPES.length)]); // recurring, varied bosses
       audioService.playNotification();
     }
     s.difficultyTimer += delta;
@@ -1270,9 +1318,24 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     }
     s.spawnTimer += delta;
     if (s.spawnTimer > (2400 / Math.max(1, s.difficulty * 0.8))) {
-      const types = (Object.keys(ENEMY_CONFIGS) as EnemyType[]).filter(t => t !== EnemyType.Boss);
-      requestSpawn(types[Math.floor(Math.random() * types.length)]);
       s.spawnTimer = 0;
+      // Higher difficulty unlocks higher tiers; pick weighted within the unlocked pool.
+      const tier = Math.min(5, 1 + Math.floor(s.difficulty / 2));
+      const pool = (Object.keys(ENEMY_CONFIGS) as EnemyType[]).filter((t) => {
+        const c = ENEMY_CONFIGS[t];
+        return !c.isBoss && c.spawnWeight > 0 && c.tier <= tier;
+      });
+      const pickWeighted = () => {
+        let total = 0;
+        for (const t of pool) total += ENEMY_CONFIGS[t].spawnWeight;
+        let r = Math.random() * total;
+        for (const t of pool) { r -= ENEMY_CONFIGS[t].spawnWeight; if (r <= 0) return t; }
+        return pool[0];
+      };
+      if (pool.length) {
+        requestSpawn(pickWeighted());
+        if (s.difficulty >= 4 && Math.random() < 0.4) requestSpawn(pickWeighted()); // denser late waves
+      }
     }
 
     s.spawnIndicators.forEach(ind => {
@@ -1281,88 +1344,228 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     });
     s.spawnIndicators = s.spawnIndicators.filter(ind => ind.timer > 0);
 
-    s.enemies.forEach(e => {
+    const rid = () => Math.random().toString(36).substring(2, 9);
+    // Engine FX shared by all moving enemies.
+    const enemyMoveFx = (e: Tank) => {
+      if (Math.random() < 0.22) addTreadMarkObj(e, treadMarkColor);
+      if (Math.random() < 0.14) {
+        const exAngle = e.angle + Math.PI;
+        s.particles.push({
+          x: e.x + Math.cos(exAngle) * (e.width / 2), y: e.y + Math.sin(exAngle) * (e.width / 2),
+          dx: Math.cos(exAngle + (Math.random() - 0.5) * 0.3) * (e.speed * 0.355),
+          dy: Math.sin(exAngle + (Math.random() - 0.5) * 0.3) * (e.speed * 0.355),
+          radius: Math.random() * 2.5 + 1.0, opacity: 0.45, lifespan: Math.random() * 15 + 8,
+          color: s.terrain === TerrainType.Desert ? 'rgba(217, 119, 6, 0.18)' : 'rgba(148, 163, 184, 0.22)',
+          type: 'exhaust',
+        });
+      }
+    };
+    // Enemy seeking missile (homes on the player; see homing block below).
+    const fireEnemyMissile = (e: Tank, tgt: PlayerEntity) => {
+      const cfg = ENEMY_CONFIGS[e.enemyType!];
+      s.bullets.push({
+        id: rid(), x: e.x, y: e.y, width: 11, height: 26, angle: e.turretAngle,
+        dx: Math.cos(e.turretAngle) * 2, dy: Math.sin(e.turretAngle) * 2,
+        damage: cfg.damage, color: cfg.color, isHighPowered: false, isSuperBullet: false, isExplosive: false,
+        isAllied: false, ownerId: e.id, radius: 9, history: [], trailHistory: [],
+        isHoming: true, isPersistent: false, phase: 'ignition', missileAge: 0,
+        turnSpeed: 0.045, currentSpeed: 2, maxSpeed: 7, wobbleOffset: Math.random() * Math.PI * 2, wobbleSpeed: 0.06,
+        targetId: tgt.id,
+      });
+    };
+
+    s.enemies.forEach((e) => {
+      const cfg = ENEMY_CONFIGS[e.enemyType!];
+      const arch = cfg.archetype;
+      const boss = cfg.isBoss;
       const target = nearestPlayer(s.players, e);
       const dist = Math.hypot(target.x - e.x, target.y - e.y);
       const angle = Math.atan2(target.y - e.y, target.x - e.x);
 
-      // Determine detection status based on current active weather settings
+      // Weather-limited detection (bosses always sense the player). Long-range
+      // specialists (sniper/artillery/homing) still sense out to their own range,
+      // so they don't freeze uselessly when parked beyond the weather cap.
       let detectsPlayer = true;
-      if (s.weather === WeatherType.Fog) {
-        detectsPlayer = dist < 260; // Restricted foggy vision
-      } else if (s.weather === WeatherType.Snowstorm) {
-        detectsPlayer = dist < 240; // Dense swirling whiteout blizzard
-      } else if (s.weather === WeatherType.Sandstorm) {
-        detectsPlayer = dist < 320; // Blinding sand storm winds
-      } else if (s.weather === WeatherType.Rain) {
-        detectsPlayer = dist < 420; // Heavy cloud/downpour darkness
+      if (!boss) {
+        let cap = Infinity;
+        if (s.weather === WeatherType.Fog) cap = 260;
+        else if (s.weather === WeatherType.Snowstorm) cap = 240;
+        else if (s.weather === WeatherType.Sandstorm) cap = 320;
+        else if (s.weather === WeatherType.Rain) cap = 420;
+        detectsPlayer = dist < Math.max(cap, cfg.range ?? 0);
       }
 
-      // 1. Steering Chassis direction
-      if (detectsPlayer) {
-        let chassisDiff = angle - e.angle;
-        while (chassisDiff < -Math.PI) chassisDiff += Math.PI * 2;
-        while (chassisDiff > Math.PI) chassisDiff -= Math.PI * 2;
-        const turnLimit = ENEMY_CONFIGS[e.enemyType!].turnSpeed;
-        e.angle += Math.max(-turnLimit, Math.min(turnLimit, chassisDiff));
-      } else {
-        // Lost telemetry target! Just wander or maintain coarse direction
-        e.angle += Math.sin(Date.now() * 0.0012 + e.x) * 0.01;
-      }
+      e.aiTimer = (e.aiTimer ?? 0) + delta;
+      e.shootTimer += delta;
 
-      // Bosses and Kamikazes move regardless, but other enemies only track if they detect the player
-      const searchTargetDist = detectsPlayer ? dist : 9999;
-      const isMoving = e.enemyType === EnemyType.Kamikaze || searchTargetDist > (e.enemyType === EnemyType.Boss ? 500 : 250);
-      if (isMoving) {
-        e.x += Math.cos(e.angle) * e.speed; e.y += Math.sin(e.angle) * e.speed;
-        
-        // Spawn tread marks for enemies
-        if (Math.random() < 0.25) {
-          addTreadMarkObj(e, treadMarkColor);
+      const steer = (toAng: number, mult = 1) => {
+        let d = toAng - e.angle;
+        while (d < -Math.PI) d += Math.PI * 2;
+        while (d > Math.PI) d -= Math.PI * 2;
+        const lim = cfg.turnSpeed * mult;
+        e.angle += Math.max(-lim, Math.min(lim, d));
+      };
+      const fwd = (sp = e.speed) => { e.x += Math.cos(e.angle) * sp; e.y += Math.sin(e.angle) * sp; };
+      let moved = false;
+
+      if (arch === 'charger') {
+        // approach → windup (telegraph) → straight dash.
+        e.turretAngle = e.angle;
+        if (e.aiPhase === 2) {
+          e.x += e.dashVX ?? 0; e.y += e.dashVY ?? 0; moved = true;
+          // Slam contact: damage the player once, then end the dash.
+          const dHit = Math.hypot(target.x - e.x, target.y - e.y);
+          if (target.health > 0 && dHit < e.width / 2 + target.width / 2 + 4) {
+            target.health -= cfg.damage;
+            audioService.playHit();
+            s.screenShake = Math.max(s.screenShake, boss ? 50 : 28);
+            createParticles(e.x, e.y, cfg.color, 16, 'spark');
+            e.aiPhase = 0; e.aiTimer = 0;
+          } else if (e.aiTimer > (boss ? 760 : 520)) { e.aiPhase = 0; e.aiTimer = 0; }
+        } else if (e.aiPhase === 1) {
+          steer(angle, 0.4);
+          if (e.aiTimer > 600) {
+            const sp = boss ? 9 : 7.5;
+            e.dashVX = Math.cos(e.angle) * sp; e.dashVY = Math.sin(e.angle) * sp;
+            e.aiPhase = 2; e.aiTimer = 0;
+          }
+        } else {
+          steer(angle);
+          if (detectsPlayer && dist > 90) { fwd(); moved = true; }
+          if (detectsPlayer && dist < 380) { e.aiPhase = 1; e.aiTimer = 0; }
         }
-        
-        // Engine exhaust particulates for enemies
-        if (Math.random() < 0.16) {
-          const exAngle = e.angle + Math.PI;
-          const exX = e.x + Math.cos(exAngle) * (e.width / 2);
-          const exY = e.y + Math.sin(exAngle) * (e.width / 2);
-          s.particles.push({
-            x: exX, y: exY,
-            dx: Math.cos(exAngle + (Math.random()-0.5)*0.3) * (e.speed * 0.355),
-            dy: Math.sin(exAngle + (Math.random()-0.5)*0.3) * (e.speed * 0.355),
-            radius: Math.random() * 2.5 + 1.0,
-            opacity: 0.45,
-            lifespan: Math.random() * 15 + 8,
-            color: s.terrain === TerrainType.Desert ? 'rgba(217, 119, 6, 0.18)' : 'rgba(148, 163, 184, 0.22)',
-            type: 'exhaust'
-          });
+      } else if (arch === 'teleporter') {
+        steer(angle, 0.5);
+        if (detectsPlayer && e.shootTimer > e.shootInterval) {
+          e.shootTimer = 0;
+          const live = s.players.filter((p) => p.health > 0);
+          const tp = live.length ? live[Math.floor(Math.random() * live.length)] : target;
+          const ba = Math.random() * Math.PI * 2;
+          const br = (cfg.range ?? 250) * (0.55 + Math.random() * 0.4);
+          createParticles(e.x, e.y, cfg.color, 16, 'spark');
+          e.x = tp.x + Math.cos(ba) * br; e.y = tp.y + Math.sin(ba) * br;
+          createParticles(e.x, e.y, cfg.color, 16, 'spark');
+          e.turretAngle = Math.atan2(tp.y - e.y, tp.x - e.x);
+          const n = cfg.projectiles ?? 1;
+          if (n > 1) for (let i = 0; i < n; i++) fireBullet(e, false, e.turretAngle + (i - (n - 1) / 2) * 0.16);
+          else fireBullet(e, false, e.turretAngle);
         }
-      }
-
-      // Turret aiming and shooting (only fires when player is within visibility)
-      if (detectsPlayer) {
+      } else if (arch === 'orbiter') {
         e.turretAngle = angle;
-        e.shootTimer += delta;
-        if (e.enemyType !== EnemyType.Kamikaze && e.shootTimer > e.shootInterval) {
-          fireBullet(e, false); e.shootTimer = 0;
-        }
+        if (detectsPlayer) {
+          const radius = cfg.range ?? 260;
+          const correction = dist > radius * 1.1 ? -0.4 : dist < radius * 0.8 ? 0.4 : 0;
+          steer(angle + (e.orbitDir ?? 1) * (Math.PI / 2 + correction));
+          fwd(); moved = true;
+          if (e.shootTimer > e.shootInterval) { fireBullet(e, false, angle); e.shootTimer = 0; }
+        } else { steer(e.angle, 0.3); }
       } else {
-        // Settle turret back to the chassis orientation
-        let turretDiff = e.angle - e.turretAngle;
-        while (turretDiff < -Math.PI) turretDiff += Math.PI * 2;
-        while (turretDiff > Math.PI) turretDiff -= Math.PI * 2;
-        e.turretAngle += Math.max(-0.04, Math.min(0.04, turretDiff));
+        // Generic: face the player, approach to a desired distance (or flee), then fire.
+        let desired = 0;
+        let flee = false;
+        switch (arch) {
+          case 'sniper': desired = cfg.range ?? 600; break;
+          case 'artillery': desired = cfg.range ?? 500; break;
+          case 'summoner': desired = 380; break;
+          case 'spinner': desired = 240; break;
+          case 'shotgun': desired = (cfg.range ?? 260) * 0.7; break;
+          case 'burst': desired = 300; break;
+          case 'homing': desired = cfg.range ?? 420; break;
+          case 'chaser': desired = cfg.range ?? 40; break; // Spitter keeps range 300
+          case 'heavy': desired = 55; break;
+          case 'shield': desired = 70; break;
+          case 'scout': desired = 110; break;
+          case 'splitter': desired = 220; break;
+          case 'mine': case 'healer': flee = true; break;
+        }
+        if (detectsPlayer) {
+          if (flee) {
+            steer(angle + Math.PI);
+            if (dist < 520) { fwd(); moved = true; } else steer(angle); // hover at the edge
+          } else {
+            steer(angle + (arch === 'scout' ? Math.sin(e.aiTimer * 0.01) * 0.6 : 0));
+            if (dist > desired + 12) { fwd(); moved = true; }
+          }
+          if (arch !== 'spinner') e.turretAngle = angle;
+        } else {
+          steer(e.angle, 0.3);
+          e.aiPhase = 0; // cancel a pending sniper telegraph when sight is lost
+        }
+
+        // Firing / abilities (most need to see the player; bosses act regardless).
+        if (detectsPlayer || boss) {
+          if (arch === 'spinner') {
+            e.turretAngle = (e.turretAngle ?? 0) + 0.22;
+            if (e.shootTimer > e.shootInterval) {
+              e.shootTimer = 0;
+              const n = cfg.projectiles ?? 6;
+              for (let i = 0; i < n; i++) fireBullet(e, false, (e.turretAngle ?? 0) + (i / n) * Math.PI * 2);
+            }
+          } else if (arch === 'shotgun') {
+            if (e.shootTimer > e.shootInterval) {
+              e.shootTimer = 0;
+              const n = cfg.projectiles ?? 5;
+              for (let i = 0; i < n; i++) fireBullet(e, false, angle + (i - (n - 1) / 2) * 0.17);
+            }
+          } else if (arch === 'burst') {
+            if ((e.aiBurst ?? 0) > 0) {
+              if (e.shootTimer > 95) { e.shootTimer = 0; fireBullet(e, false, angle); e.aiBurst = (e.aiBurst ?? 1) - 1; }
+            } else if (e.shootTimer > e.shootInterval) { e.shootTimer = 0; e.aiBurst = cfg.burstCount ?? 6; }
+          } else if (arch === 'sniper') {
+            if (e.aiPhase === 1) {
+              const dx = Math.cos(angle), dy = Math.sin(angle);
+              s.beams.push({ x1: e.x, y1: e.y, x2: e.x + dx * 1400, y2: e.y + dy * 1400, color: cfg.color, life: 2, maxLife: 6, width: 1.4 });
+              if (e.aiTimer > 700) { e.aiPhase = 0; e.shootTimer = 0; fireBullet(e, false, angle); }
+            } else if (e.shootTimer > e.shootInterval) { e.aiPhase = 1; e.aiTimer = 0; }
+          } else if (arch === 'artillery') {
+            if (e.shootTimer > e.shootInterval) {
+              e.shootTimer = 0;
+              const n = cfg.projectiles ?? 1;
+              for (let i = 0; i < n; i++) {
+                const j = i === 0 ? 0 : 150;
+                s.hazards.push({ id: rid(), kind: 'strike', x: target.x + (Math.random() - 0.5) * j, y: target.y + (Math.random() - 0.5) * j, timer: 80, maxTimer: 80, radius: boss ? 130 : 95, damage: cfg.damage });
+              }
+              audioService.playShoot(false);
+            }
+          } else if (arch === 'homing') {
+            if (e.shootTimer > e.shootInterval) { e.shootTimer = 0; e.turretAngle = angle; fireEnemyMissile(e, target); }
+          } else if (arch === 'mine') {
+            if (e.shootTimer > e.shootInterval) { e.shootTimer = 0; s.hazards.push({ id: rid(), kind: 'mine', x: e.x, y: e.y, timer: 38, maxTimer: 700, radius: 72, damage: cfg.damage, armed: false }); }
+          } else if (arch === 'healer') {
+            if (e.shootTimer > e.shootInterval) {
+              e.shootTimer = 0;
+              for (const o of s.enemies) {
+                if (o !== e && o.health > 0 && o.health < o.maxHealth && Math.hypot(o.x - e.x, o.y - e.y) < (cfg.range ?? 320)) {
+                  o.health = Math.min(o.maxHealth, o.health + o.maxHealth * 0.12);
+                  createParticles(o.x, o.y, '#4ade80', 5, 'spark');
+                }
+              }
+            }
+          } else if (arch === 'summoner') {
+            if (cfg.childKey && e.shootTimer > e.shootInterval && s.enemies.length < MAX_ENEMIES) {
+              e.shootTimer = 0;
+              const cnt = e.enemyType === EnemyType.Hive ? 4 : 3;
+              for (let i = 0; i < cnt; i++) {
+                const a = Math.random() * Math.PI * 2;
+                spawnSpecificEnemy(cfg.childKey, e.x + Math.cos(a) * (e.width * 0.6), e.y + Math.sin(a) * (e.width * 0.6));
+              }
+            }
+            if ((cfg.projectiles ?? 0) > 0) {
+              e.specialAttackTimer = (e.specialAttackTimer ?? 0) + delta;
+              if (e.specialAttackTimer > 2600) {
+                e.specialAttackTimer = 0;
+                const n = cfg.projectiles!;
+                for (let i = 0; i < n; i++) fireBullet(e, false, (i / n) * Math.PI * 2);
+              }
+            }
+          } else if (arch !== 'rammer') {
+            // chaser / heavy / scout / shield / splitter: single aimed shot.
+            if (e.shootTimer > e.shootInterval) { e.shootTimer = 0; fireBullet(e, false, angle); }
+          }
+        }
       }
 
-      if (e.enemyType === EnemyType.Boss) {
-        if (!e.specialAttackTimer) e.specialAttackTimer = 0;
-        e.specialAttackTimer += delta;
-        // Boss specialized attack fires anyway but is slower if player isn't detected
-        if (e.specialAttackTimer > (detectsPlayer ? 3000 : 5000)) {
-          e.specialAttackTimer = 0;
-          for (let i = 0; i < 18; i++) fireBullet(e, false, (i / 18) * Math.PI * 2);
-        }
-      }
+      if (moved) enemyMoveFx(e);
     });
 
     // RESOLVE TANK COLLISIONS
@@ -1373,6 +1576,11 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     for (const p of s.players) {
       p.x = Math.max(30, Math.min(s.worldW - 30, p.x));
       p.y = Math.max(30, Math.min(s.worldH - 30, p.y));
+    }
+    // Keep enemies on (or just off) the field — a dashing charger can't fly away.
+    for (const e of s.enemies) {
+      e.x = Math.max(-60, Math.min(s.worldW + 60, e.x));
+      e.y = Math.max(-60, Math.min(s.worldH + 60, e.y));
     }
 
     const bToRemove = new Set<string>();
@@ -1398,17 +1606,22 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
       
       if (b.isHoming) {
           b.missileAge! += 1;
+          if (!b.isAllied && b.missileAge! > 360) { bToRemove.add(b.id); return; } // enemy missiles expire
+          if (b.isPersistent && b.missileAge! > 900) { bToRemove.add(b.id); return; } // allied swarm missiles expire too (no infinite orbit)
           if (b.phase === 'eject' && b.missileAge! > 25) b.phase = 'ignition';
-          if (b.phase === 'ignition') { 
-              b.currentSpeed = Math.min(b.maxSpeed!, b.currentSpeed! + 1.5); 
-              b.phase = 'homing'; 
+          if (b.phase === 'ignition') {
+              b.currentSpeed = Math.min(b.maxSpeed!, b.currentSpeed! + 1.5);
+              b.phase = 'homing';
           }
           if (b.phase === 'homing') {
               b.currentSpeed = Math.min(b.maxSpeed!, b.currentSpeed! + 0.45);
-              // Versus: missiles hunt other tanks; co-op: AI enemies.
-              const homingPool: Tank[] = versusRef.current
-                ? s.players.filter((p) => p.id !== b.ownerId && p.health > 0)
-                : s.enemies;
+              // Allied missiles hunt enemies (or other players in versus); enemy
+              // missiles (Hornet) hunt the players.
+              const homingPool: Tank[] = !b.isAllied
+                ? s.players.filter((p) => p.health > 0)
+                : versusRef.current
+                  ? s.players.filter((p) => p.id !== b.ownerId && p.health > 0)
+                  : s.enemies;
               if (!b.targetId || !homingPool.find(e => e.id === b.targetId)) {
                   let nearest = null; let minDist = Infinity;
                   homingPool.forEach(e => {
@@ -1483,6 +1696,18 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
         }
         s.enemies.forEach(e => {
           if (Math.hypot(b.x - e.x, b.y - e.y) < e.width/2 + b.radius) {
+            // Frontal shield (Aegis/Ward): bullets hitting the ~140° front arc are
+            // blocked — flank the rear/sides to land damage.
+            if (archOf(e) === 'shield') {
+              let rel = Math.atan2(b.y - e.y, b.x - e.x) - e.angle;
+              while (rel < -Math.PI) rel += Math.PI * 2;
+              while (rel > Math.PI) rel -= Math.PI * 2;
+              if (Math.abs(rel) < 1.22) { // ~70° each side
+                bToRemove.add(b.id);
+                createParticles(b.x, b.y, '#e2e8f0', 6, 'spark');
+                return;
+              }
+            }
             e.health -= b.damage; bToRemove.add(b.id);
             createParticles(b.x, b.y, e.color, 15, 'spark');
             if (e.health <= 0) onEnemyKill(e);
@@ -1550,7 +1775,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
       const origin = s.players[nukeIdx] ?? s.players[0];
       s.nukeCounter = 0; s.screenShake = 150; s.screenFlash = 1.0;
       s.explosions.push({ x: origin.x, y: origin.y, radius: 10, maxRadius: 1800, opacity: 1, fadeSpeed: 0.008, color: '#fef3c7' });
-      s.enemies.forEach(e => { if(e.enemyType === EnemyType.Boss) e.health -= 600; else e.health = 0; onEnemyKill(e); });
+      s.enemies.forEach(e => { if (isBossE(e)) e.health -= 600; else e.health = 0; if (e.health <= 0) onEnemyKill(e); });
       s.bullets = s.bullets.filter(b => b.isAllied);
       audioService.playNuke();
       onStateUpdate({ nukeReady: false, nukeProgress: 0 });
@@ -1681,6 +1906,46 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     s.fireAlerts.forEach((a) => a.life--);
     s.fireAlerts = s.fireAlerts.filter((a) => a.life > 0);
 
+    // Ground hazards: artillery strikes splash on impact; mines arm then detonate
+    // when a player drives into them. (Solo only — enemies don't exist online.)
+    if (s.hazards.length) {
+      const removeHz = new Set<string>();
+      for (const hz of s.hazards) {
+        if (hz.kind === 'strike') {
+          hz.timer--;
+          if (hz.timer <= 0) {
+            s.explosions.push({ x: hz.x, y: hz.y, radius: 8, maxRadius: hz.radius * 1.7, opacity: 1, fadeSpeed: 0.05, color: '#f59e0b' });
+            s.screenShake = Math.max(s.screenShake, 18);
+            createParticles(hz.x, hz.y, '#f59e0b', 18, 'spark');
+            for (const p of s.players) if (p.health > 0 && Math.hypot(p.x - hz.x, p.y - hz.y) < hz.radius) p.health -= hz.damage;
+            removeHz.add(hz.id);
+          }
+        } else {
+          // mine
+          if (!hz.armed) {
+            hz.timer--;
+            if (hz.timer <= 0) { hz.armed = true; hz.timer = hz.maxTimer; }
+          } else {
+            hz.timer--;
+            if (hz.timer <= 0) removeHz.add(hz.id);
+            else {
+              for (const p of s.players) {
+                if (p.health > 0 && Math.hypot(p.x - hz.x, p.y - hz.y) < hz.radius) {
+                  s.explosions.push({ x: hz.x, y: hz.y, radius: 6, maxRadius: 155, opacity: 1, fadeSpeed: 0.06, color: '#84cc16' });
+                  s.screenShake = Math.max(s.screenShake, 20);
+                  createParticles(hz.x, hz.y, '#84cc16', 16, 'spark');
+                  p.health -= hz.damage;
+                  removeHz.add(hz.id);
+                  break;
+                }
+              }
+            }
+          }
+        }
+      }
+      if (removeHz.size) s.hazards = s.hazards.filter((hz) => !removeHz.has(hz.id));
+    }
+
     s.explosions.forEach(exp => { exp.radius += 16; exp.opacity -= exp.fadeSpeed; });
     s.explosions = s.explosions.filter(exp => exp.opacity > 0);
     s.particles.forEach(p => { p.x += p.dx; p.y += p.dy; p.lifespan--; p.opacity -= 0.025; });
@@ -1739,7 +2004,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     // 1. Draw headlight cones in world coordinates
     ctx.save(); 
     ctx.rotate(t.angle);
-    if (t.type === 'player' || t.enemyType === EnemyType.Boss) {
+    if (t.type === 'player' || isBossE(t)) {
       const bGrad = ctx.createRadialGradient(L/2, 0, 0, L/2+280, 0, 280);
       const headlightColor = t.type === 'player' ? 'rgba(56, 189, 248, 0.45)' : 'rgba(239, 68, 68, 0.35)';
       bGrad.addColorStop(0, headlightColor);
@@ -1814,19 +2079,15 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
         // Player gets high tech hyper blue chassis
         fillStyle = '#0f172a'; // Sleek dark metallic hull
         strokeStyle = '#38bdf8'; // Glowing neon blue accents
-    } else if (t.enemyType === EnemyType.Boss) {
-        fillStyle = '#111827'; // Dark purple-black titan structure
-        strokeStyle = '#a855f7'; // Glowing purple neon borders
-    } else if (t.enemyType === EnemyType.Heavy) {
-        fillStyle = '#1e293b';
-        strokeStyle = '#e2e8f0'; // Cast iron armor look
-    } else if (t.enemyType === EnemyType.Kamikaze) {
+    } else if (isBossE(t)) {
+        fillStyle = '#111827';
+        strokeStyle = enemyCfg(t)?.color ?? '#a855f7';
+    } else if (archOf(t) === 'rammer') {
         fillStyle = '#7f1d1d';
         strokeStyle = '#ef4444'; // Alarm red
     } else {
-        // normal or fast
         fillStyle = '#111827';
-        strokeStyle = t.color;
+        strokeStyle = enemyCfg(t)?.color ?? t.color;
     }
 
     ctx.fillStyle = fillStyle;
@@ -1870,7 +2131,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     // Centered pulsing Fusion Engine reactor core
     const corePulse = 1 + Math.sin(Date.now() / 100) * 0.12;
     const coreSize = L * 0.15 * corePulse;
-    const coreColor = t.type === 'player' ? '#38bdf8' : (t.enemyType === EnemyType.Boss ? '#c084fc' : (t.enemyType === EnemyType.Kamikaze ? '#ef4444' : strokeStyle));
+    const coreColor = t.type === 'player' ? '#38bdf8' : (isBossE(t) ? '#c084fc' : (archOf(t) === 'rammer' ? '#ef4444' : strokeStyle));
     ctx.shadowBlur = 12;
     ctx.shadowColor = coreColor;
     const coreGrad = ctx.createRadialGradient(0, 0, 0, 0, 0, coreSize);
@@ -1892,7 +2153,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
 
     // Draw Barrel overlay with custom shading details (with muzzle flash glare tip)
     const barrelLength = L * 0.95;
-    const barrelW = t.enemyType === EnemyType.Boss ? 15 : (t.enemyType === EnemyType.Heavy ? 12 : 8);
+    const barrelW = isBossE(t) ? 15 : ((enemyCfg(t)?.size ?? 0) >= 56 ? 12 : 8);
 
     // Drop Shadow for barrel
     ctx.fillStyle = 'rgba(0,0,0,0.35)';
@@ -1939,7 +2200,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     ctx.restore(); // restored turret angle matrix
 
     // 6. Tank Health Bar (Fitted for non-Boss units directly above with neon segment layout)
-    if (t.enemyType !== EnemyType.Boss) {
+    if (!isBossE(t)) {
       const barY = -W/2 - 28;
       ctx.fillStyle = 'rgba(15, 23, 42, 0.7)';
       ctx.beginPath();
@@ -2018,6 +2279,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
       arena: { w: cs.worldW, h: cs.worldH },
       obstacles: cs.obstacles,
       fireAlerts: cs.fireAlerts,
+      hazards: cs.hazards,
       storm: {
         active: cs.storm.active,
         cx: cs.storm.cx,

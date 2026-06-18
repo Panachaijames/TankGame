@@ -1,7 +1,7 @@
 import { Application, Container, Graphics, Sprite, Text, Rectangle, type Texture } from 'pixi.js';
 import { AdvancedBloomFilter } from 'pixi-filters';
-import { EnemyType, WeatherType, TerrainType, type Tank } from '../types';
-import { TANK_CLASSES } from '../constants';
+import { WeatherType, TerrainType, type Tank, type EnemyShape } from '../types';
+import { TANK_CLASSES, ENEMY_CONFIGS } from '../constants';
 import type { WorldSnapshot } from '../components/Battlefield';
 import { makeRingTexture, makeSoftCircleTexture } from './textures';
 import { cameraOffset } from '../sim/camera';
@@ -41,12 +41,13 @@ const WEATHER: Partial<Record<WeatherType, { tint: number; rad: number; alpha: n
   [WeatherType.Rain]: { tint: 0x0a0f19, rad: 450, alpha: 0.5 },
 };
 
+const ecfg = (t: Tank) => (t.enemyType ? ENEMY_CONFIGS[t.enemyType] : undefined);
+
 function tankColors(t: Tank): { fill: number; stroke: number | string; cone: number | string } {
   if (t.type === 'player') return { fill: 0x0f172a, stroke: t.color, cone: t.color };
-  if (t.enemyType === EnemyType.Boss) return { fill: 0x111827, stroke: 0xa855f7, cone: 0xa855f7 };
-  if (t.enemyType === EnemyType.Heavy) return { fill: 0x1e293b, stroke: 0xe2e8f0, cone: 0xe2e8f0 };
-  if (t.enemyType === EnemyType.Kamikaze) return { fill: 0x7f1d1d, stroke: 0xef4444, cone: 0xef4444 };
-  return { fill: 0x111827, stroke: t.color, cone: 0xef4444 };
+  const c = ecfg(t);
+  const col = c?.color ?? t.color ?? '#ef4444'; // roster colour per enemy
+  return { fill: c?.isBoss ? 0x111827 : 0x141a26, stroke: col, cone: col };
 }
 
 export class PixiRenderer {
@@ -63,6 +64,7 @@ export class PixiRenderer {
   private decals!: Graphics;
   private repair!: Graphics;
   private obstacles!: Graphics; // cover/crates (world space, below tanks)
+  private hazardGfx!: Graphics; // artillery warnings + mines (world space)
   private fx!: Container; // bloomed
   private tankLayer!: Container;
   private bullets!: Graphics;
@@ -133,7 +135,8 @@ export class PixiRenderer {
     this.decals = new Graphics();
     this.repair = new Graphics();
     this.obstacles = new Graphics();
-    this.ground.addChild(this.bg, this.groundGlow, this.decals, this.repair, this.obstacles);
+    this.hazardGfx = new Graphics();
+    this.ground.addChild(this.bg, this.groundGlow, this.decals, this.repair, this.obstacles, this.hazardGfx);
     this.world.addChild(this.ground);
 
     this.fx = new Container();
@@ -253,6 +256,7 @@ export class PixiRenderer {
     this.drawBackground(snap);
     this.drawDecals(snap);
     this.drawObstacles(snap);
+    this.drawHazards(snap);
     this.drawRepair(snap);
     this.syncTanks(snap);
     this.drawBullets(snap);
@@ -359,6 +363,25 @@ export class PixiRenderer {
     }
   }
 
+  private drawHazards(snap: WorldSnapshot) {
+    const g = this.hazardGfx;
+    g.clear();
+    for (const hz of snap.hazards ?? []) {
+      if (hz.kind === 'strike') {
+        // Telegraphed blast: outer ring = full radius, inner fill grows toward impact.
+        const k = 1 - hz.timer / hz.maxTimer; // 0 → 1 at impact
+        g.circle(hz.x, hz.y, hz.radius).stroke({ width: 2, color: 0xf59e0b, alpha: 0.5 + 0.3 * Math.sin(this.time * 0.4) });
+        g.circle(hz.x, hz.y, hz.radius * k).fill({ color: 0xf59e0b, alpha: 0.18 });
+      } else {
+        // Mine: dim while arming, bright blinking once armed.
+        const blink = hz.armed ? 0.4 + 0.4 * Math.sin(this.time * 0.5) : 0.25;
+        g.circle(hz.x, hz.y, 7).fill({ color: 0x84cc16, alpha: blink });
+        g.circle(hz.x, hz.y, 7).stroke({ width: 1.5, color: 0x84cc16, alpha: 0.8 });
+        if (hz.armed) g.circle(hz.x, hz.y, hz.radius).stroke({ width: 1, color: 0x84cc16, alpha: 0.12 });
+      }
+    }
+  }
+
   private drawRepair(snap: WorldSnapshot) {
     const g = this.repair;
     g.clear();
@@ -441,7 +464,9 @@ export class PixiRenderer {
 
     const cls = t.type === 'player' ? t.tankClass ?? 'assault' : null;
 
-    if (cls === 'vanguard') {
+    if (t.type === 'enemy') {
+      this.drawEnemyShape(g, t, fill, stroke);
+    } else if (cls === 'vanguard') {
       // Heavy brawler: wide hull, fat treads, bolted side armour plates, rivets.
       g.roundRect(-w / 2 - 2, -h / 2 - 4, w + 4, 9, 3).fill(0x0b1220);
       g.roundRect(-w / 2 - 2, h / 2 - 5, w + 4, 9, 3).fill(0x0b1220);
@@ -480,10 +505,80 @@ export class PixiRenderer {
         .stroke({ width: 2, color: stroke, alpha: 0.85 });
     }
 
-    // Reactor core — class accent for players (bright → blooms).
-    const accent = t.type === 'player' ? TANK_CLASSES[t.tankClass ?? 'assault'].accent : stroke;
-    g.circle(0, 0, 9).fill({ color: accent, alpha: 0.35 });
-    g.circle(0, 0, 4).fill(0xffffff);
+    // Reactor core — class accent for players (bright → blooms). Enemies get
+    // their own core inside drawEnemyShape.
+    if (t.type === 'player') {
+      const accent = TANK_CLASSES[t.tankClass ?? 'assault'].accent;
+      g.circle(0, 0, 9).fill({ color: accent, alpha: 0.35 });
+      g.circle(0, 0, 4).fill(0xffffff);
+    }
+  }
+
+  /** Procedural enemy hull — one of 12 silhouettes per the roster `shape`. */
+  private drawEnemyShape(g: Graphics, t: Tank, fill: number, stroke: number | string) {
+    const w = t.width;
+    const h = t.height;
+    const r = w / 2;
+    const shape: EnemyShape = ecfg(t)?.shape ?? 'block';
+    const line = { width: 2.5, color: stroke, alpha: 0.95 } as const;
+    const poly = (pts: number[]) => g.poly(pts).fill(fill).stroke(line);
+    switch (shape) {
+      case 'block':
+        g.roundRect(-w / 2, -h / 2, w, h, 5).fill(fill).stroke(line);
+        break;
+      case 'diamond':
+        poly([r, 0, 0, -h / 2, -r, 0, 0, h / 2]);
+        break;
+      case 'hex': {
+        const p: number[] = [];
+        for (let i = 0; i < 6; i++) { const a = (i / 6) * Math.PI * 2; p.push(Math.cos(a) * r, Math.sin(a) * r * 0.92); }
+        poly(p);
+        break;
+      }
+      case 'pentagon': {
+        const p: number[] = [];
+        for (let i = 0; i < 5; i++) { const a = (i / 5) * Math.PI * 2 - Math.PI / 2; p.push(Math.cos(a) * r, Math.sin(a) * r); }
+        poly(p);
+        break;
+      }
+      case 'triangle':
+        poly([r, 0, -r, -h / 2, -r, h / 2]);
+        break;
+      case 'arrow':
+        poly([r, 0, -r * 0.4, -h / 2, -r * 0.1, 0, -r * 0.4, h / 2]);
+        break;
+      case 'wedge':
+        poly([r, -h / 2, r, h / 2, -r, h * 0.28, -r, -h * 0.28]);
+        break;
+      case 'chevron':
+        poly([r, 0, r * 0.1, -h / 2, -r * 0.5, -h / 2, r * 0.35, 0, -r * 0.5, h / 2, r * 0.1, h / 2]);
+        break;
+      case 'orb':
+        g.circle(0, 0, r).fill(fill).stroke(line);
+        break;
+      case 'ring':
+        g.circle(0, 0, r * 0.6).fill({ color: fill, alpha: 0.5 });
+        g.circle(0, 0, r).stroke({ width: Math.max(4, w * 0.16), color: stroke, alpha: 0.95 });
+        break;
+      case 'cross': {
+        const a = w * 0.22;
+        g.rect(-a, -h / 2, a * 2, h).fill(fill);
+        g.rect(-w / 2, -a, w, a * 2).fill(fill);
+        g.rect(-a, -h / 2, a * 2, h).stroke({ width: 2, color: stroke, alpha: 0.9 });
+        g.rect(-w / 2, -a, w, a * 2).stroke({ width: 2, color: stroke, alpha: 0.9 });
+        break;
+      }
+      case 'spike': {
+        const p: number[] = [];
+        const n = 8;
+        for (let i = 0; i < n * 2; i++) { const a = (i / (n * 2)) * Math.PI * 2; const rad = i % 2 === 0 ? r : r * 0.48; p.push(Math.cos(a) * rad, Math.sin(a) * rad); }
+        poly(p);
+        break;
+      }
+    }
+    // Menacing core.
+    g.circle(0, 0, Math.max(3, w * 0.12)).fill({ color: stroke, alpha: 0.5 });
+    g.circle(0, 0, Math.max(2, w * 0.06)).fill(0xffffff);
   }
 
   private drawTurret(g: Graphics, t: Tank) {
@@ -515,22 +610,34 @@ export class PixiRenderer {
       g.circle(0, 0, w * 0.26).fill(0x0f172a).stroke({ width: 2.5, color: stroke, alpha: 0.95 });
     } else {
       // Assault (and AI enemies): single barrel + offset gun-sight.
-      const cfg = cls ? TANK_CLASSES[cls] : null;
-      const bl = w * (cfg ? cfg.barrelLen : 0.72);
-      const bw = Math.max(4, w * (cfg ? cfg.barrelW : 0.13));
-      g.roundRect(0, -bw / 2, bl, bw, 2).fill(0x1e293b).stroke({ width: 1.5, color: stroke, alpha: 0.8 });
-      g.roundRect(bl - 4, -bw / 2, 4, bw, 1).fill(accent);
-      if (cls === 'assault') g.rect(-w * 0.04, -w * 0.34, w * 0.16, w * 0.15).fill({ color: 0x0f172a }).stroke({ width: 1.2, color: stroke, alpha: 0.7 });
-      g.circle(0, 0, w * 0.3).fill(0x0f172a).stroke({ width: 2.5, color: stroke, alpha: 0.95 });
+      const arch = t.type === 'enemy' ? ecfg(t)?.archetype : null;
+      if (arch !== 'rammer') {
+        // Rammers (Kamikaze) have no gun.
+        const cfg = cls ? TANK_CLASSES[cls] : null;
+        const bl = w * (cfg ? cfg.barrelLen : 0.7);
+        const bw = Math.max(4, w * (cfg ? cfg.barrelW : 0.14));
+        g.roundRect(0, -bw / 2, bl, bw, 2).fill(0x1e293b).stroke({ width: 1.5, color: stroke, alpha: 0.8 });
+        g.roundRect(bl - 4, -bw / 2, 4, bw, 1).fill(accent);
+        if (cls === 'assault') g.rect(-w * 0.04, -w * 0.34, w * 0.16, w * 0.15).fill({ color: 0x0f172a }).stroke({ width: 1.2, color: stroke, alpha: 0.7 });
+        g.circle(0, 0, w * 0.3).fill(0x0f172a).stroke({ width: 2.5, color: stroke, alpha: 0.95 });
+      }
     }
     g.circle(0, 0, 3).fill(accent);
   }
 
   private drawHealth(g: Graphics, t: Tank) {
     g.clear();
-    if (t.enemyType === EnemyType.Boss) return;
     const pct = Math.max(0, Math.min(1, t.health / t.maxHealth));
     const isPlayer = t.type === 'player';
+    // Bosses get a prominent wide bar above their hull.
+    if (ecfg(t)?.isBoss) {
+      const bw = t.width * 1.1;
+      const y = -t.height / 2 - 18;
+      g.roundRect(-bw / 2, y, bw, 8, 3).fill({ color: 0x000000, alpha: 0.6 });
+      g.roundRect(-bw / 2, y, bw * pct, 8, 3).fill({ color: pct > 0.4 ? 0xef4444 : 0xfb7185 });
+      g.roundRect(-bw / 2, y, bw, 8, 3).stroke({ width: 1.5, color: 0xffffff, alpha: 0.5 });
+      return;
+    }
     if (pct >= 1 && !isPlayer) return; // hide full-health enemy bars (less clutter)
     const bw = t.width;
     const y = -t.height / 2 - 12;

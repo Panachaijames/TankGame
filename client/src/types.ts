@@ -29,6 +29,13 @@ export interface Tank extends Entity {
   enemyType?: EnemyType;
   recoilOffset: number;
   specialAttackTimer?: number;
+  // Enemy AI scratch state (archetype-specific; undefined on players).
+  aiTimer?: number; // general fire/ability cadence (ms)
+  aiPhase?: number; // 0 normal · 1 windup · 2 dash/active (charger/teleporter/sniper)
+  aiBurst?: number; // shots left in the current burst
+  dashVX?: number; // charger dash velocity
+  dashVY?: number;
+  orbitDir?: number; // +1 / -1 orbit direction
   // Player-only weapon/loadout fields (used by the renderer for the ammo bar,
   // barrel shape and class accent). Undefined on enemies.
   tankClass?: TankClass;
@@ -86,12 +93,50 @@ export enum PowerUpType {
 }
 
 export enum EnemyType {
-  Normal = 'Normal',
-  Heavy = 'Heavy',
-  Fast = 'Fast',
+  // Tier 1-2 fodder + early specialists
+  Grunt = 'Grunt',
+  Scout = 'Scout',
+  Bruiser = 'Bruiser',
   Kamikaze = 'Kamikaze',
-  Boss = 'Boss'
+  Shotgunner = 'Shotgunner',
+  Gunner = 'Gunner',
+  Stalker = 'Stalker',
+  Skirmisher = 'Skirmisher',
+  Spitter = 'Spitter',
+  SwarmSpawn = 'SwarmSpawn',
+  // Tier 3 specialists
+  Marksman = 'Marksman',
+  Mortar = 'Mortar',
+  Spiralist = 'Spiralist',
+  Satellite = 'Satellite',
+  Lancer = 'Lancer',
+  Hornet = 'Hornet',
+  Sapper = 'Sapper',
+  // Tier 4-5 elites
+  AegisBruiser = 'AegisBruiser',
+  SwarmMatron = 'SwarmMatron',
+  MendDrone = 'MendDrone',
+  VoidBlink = 'VoidBlink',
+  FlakBattery = 'FlakBattery',
+  WardWeaver = 'WardWeaver',
+  PhaseReaver = 'PhaseReaver',
+  Drone = 'Drone',
+  Swarmer = 'Swarmer',
+  // Bosses
+  Overlord = 'Overlord',
+  Juggernaut = 'Juggernaut',
+  Hive = 'Hive',
+  ArtilleryTitan = 'ArtilleryTitan',
 }
+
+export type EnemyArchetype =
+  | 'chaser' | 'scout' | 'heavy' | 'rammer' | 'shotgun' | 'burst' | 'orbiter'
+  | 'charger' | 'sniper' | 'artillery' | 'spinner' | 'homing' | 'mine' | 'shield'
+  | 'splitter' | 'healer' | 'teleporter' | 'summoner';
+
+export type EnemyShape =
+  | 'block' | 'diamond' | 'hex' | 'arrow' | 'orb' | 'cross' | 'spike'
+  | 'wedge' | 'ring' | 'triangle' | 'pentagon' | 'chevron';
 
 export enum WeatherType {
   Clear = 'Clear',
