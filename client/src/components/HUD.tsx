@@ -4,9 +4,10 @@ import { GameState } from '../types';
 
 interface HUDProps {
   state: GameState;
+  versus?: boolean; // PvP: hide the co-op-only nuke/air-strike module
 }
 
-const HUD: React.FC<HUDProps> = ({ state }) => {
+const HUD: React.FC<HUDProps> = ({ state, versus }) => {
   const isHighCombo = state.combo >= 10;
   const isLowAmmo = state.ammo <= 10 && !state.isCooldown;
   const nextSwarm = 10 - (state.combo % 10);
@@ -55,7 +56,8 @@ const HUD: React.FC<HUDProps> = ({ state }) => {
           </div>
         </div>
 
-        {/* Module 3: Specials (Nuke & Strike) */}
+        {/* Module 3: Specials (Nuke & Strike) — co-op only (disabled in PvP) */}
+        {!versus && (
         <div className="flex-[1.5] bg-slate-900/60 backdrop-blur-xl border border-slate-700/50 rounded-xl px-4 flex items-center gap-4 shadow-[0_4px_20px_rgba(0,0,0,0.4)]">
           {/* Nuke Charge */}
           <div className="flex-1">
@@ -87,6 +89,7 @@ const HUD: React.FC<HUDProps> = ({ state }) => {
             </div>
           </div>
         </div>
+        )}
 
         {/* Module 3.5: Ultimate */}
         <div className="flex-1 bg-slate-900/60 backdrop-blur-xl border border-slate-700/50 rounded-xl px-4 flex items-center shadow-[0_4px_20px_rgba(0,0,0,0.4)]">

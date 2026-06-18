@@ -15,7 +15,7 @@ export interface LobbyPlayer {
 
 type Phase = 'idle' | 'connecting' | 'lobby' | 'error';
 
-export const MAX_PLAYERS = 5; // host + 4 (fits the 1000x700 arena without a follow-camera)
+export const MAX_PLAYERS = 10; // host + 9 — battle royale on the big follow-camera world
 
 interface NetState {
   phase: Phase;
@@ -128,7 +128,7 @@ export const NetProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (msg.t === 'roster') {
         setNet((n) => ({ ...n, players: (msg.players as LobbyPlayer[]) || [] }));
       } else if (msg.t === 'full') {
-        setNet((n) => ({ ...n, phase: 'error', error: 'That room is full (max 5 pilots).' }));
+        setNet((n) => ({ ...n, phase: 'error', error: `That room is full (max ${MAX_PLAYERS} pilots).` }));
         sessionRef.current?.close();
       } else if (msg.t === 'snapshot') {
         snapshotRef.current = msg.s;

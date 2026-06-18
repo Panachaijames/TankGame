@@ -1,6 +1,6 @@
 import type { MatchConfig, SessionKind, MatchMode, TankClass, PlayerConfig } from '../types';
 
-export const PLAYER_COLORS = ['#38bdf8', '#fbbf24', '#22c55e', '#a855f7', '#fb7185'];
+export const PLAYER_COLORS = ['#38bdf8', '#fbbf24', '#22c55e', '#a855f7', '#fb7185', '#f97316', '#14b8a6', '#e879f9', '#84cc16', '#60a5fa'];
 
 /** Build the shared online MatchConfig from a lobby roster. The same config is
  *  used by every peer; each peer decides which player is "local" via its own id. */

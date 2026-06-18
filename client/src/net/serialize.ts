@@ -75,6 +75,19 @@ export function serializeSnapshot(s: WorldSnapshot): unknown {
     bomberProgress: r(s.bomberProgress),
     bomberReady: s.bomberReady,
     arena: s.arena,
+    obstacles: s.obstacles.map((o) => ({ id: o.id, x: o.x, y: o.y, w: o.w, h: o.h, kind: o.kind, health: r(o.health), maxHealth: o.maxHealth })),
+    fireAlerts: s.fireAlerts.map((a) => ({ x: r(a.x), y: r(a.y), ownerId: a.ownerId, life: a.life, maxLife: a.maxLife })),
+    storm: s.storm
+      ? {
+          active: s.storm.active,
+          cx: r(s.storm.cx),
+          cy: r(s.storm.cy),
+          radius: r(s.storm.radius),
+          toCx: r(s.storm.toCx),
+          toCy: r(s.storm.toCy),
+          toR: r(s.storm.toR),
+        }
+      : undefined,
   };
 }
 
@@ -109,5 +122,8 @@ export function deserializeSnapshot(data: any, localId: string): WorldSnapshot {
     bomberProgress: data.bomberProgress || 0,
     bomberReady: !!data.bomberReady,
     arena: data.arena || { w: 1000, h: 700 },
+    obstacles: data.obstacles || [],
+    fireAlerts: data.fireAlerts || [],
+    storm: data.storm,
   } as WorldSnapshot;
 }

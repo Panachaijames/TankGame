@@ -110,6 +110,29 @@ interface EnergyCell {
   opacity: number;
 }
 
+// Cover/obstacles. `crate` is destructible (blocks + drops an energy cell when
+// shot — the energy source for versus ultimates); `rock` is permanent cover.
+export interface Obstacle {
+  id: string;
+  x: number; // centre
+  y: number;
+  w: number;
+  h: number;
+  kind: 'crate' | 'rock';
+  health: number; // 0 for rocks (indestructible)
+  maxHealth: number;
+}
+
+// A gunshot "noise" ping: where a player fired. Nearby enemies see it as an
+// on-screen ring or an off-screen edge marker (positional audio, visualised).
+export interface FireAlert {
+  x: number;
+  y: number;
+  ownerId: string;
+  life: number;
+  maxLife: number;
+}
+
 export interface WorldSnapshot {
   players: Tank[];
   player: Tank;
@@ -137,6 +160,21 @@ export interface WorldSnapshot {
   bomberProgress: number;
   bomberReady: boolean;
   arena: { w: number; h: number };
+  storm?: StormSnapshot;
+  obstacles: Obstacle[];
+  fireAlerts: FireAlert[];
+}
+
+// ION STORM — the shrinking PvP safe-zone (versus). `cx/cy/radius` is the live
+// zone; `toCx/toCy/toR` is where it's closing to next.
+export interface StormSnapshot {
+  active: boolean;
+  cx: number;
+  cy: number;
+  radius: number;
+  toCx: number;
+  toCy: number;
+  toR: number;
 }
 
 export interface GameOverResult {
@@ -190,9 +228,10 @@ type PlayerEntity = Tank & {
   maxEnergy: number;
   ultActiveTimer: number;
   ultSpin: number;
+  lastFireAlert?: number; // throttle for gunshot proximity pings
 };
 
-const PLAYER_COLORS = ['#38bdf8', '#fbbf24', '#22c55e', '#a855f7', '#fb7185'];
+const PLAYER_COLORS = ['#38bdf8', '#fbbf24', '#22c55e', '#a855f7', '#fb7185', '#f97316', '#14b8a6', '#e879f9', '#84cc16', '#60a5fa'];
 
 // Distinct, far-apart multiplayer spawns. Ordered so 2 players take opposite
 // corners, then the remaining corners, then centre — never bunched together.
@@ -204,20 +243,77 @@ const SPAWN_POINTS = [
   { x: 500, y: 350 }, // centre
 ];
 
-// Battle-royale spawns as fractions of the big world — spread to the far edges
-// so players start thousands of units apart, out of each other's view (a whole
-// viewport is only ~1000×700 of the world). Order keeps any two players opposite.
+// Battle-royale spawns as fractions of the big world — spread around the map so
+// players start far apart, out of each other's view (a viewport is only
+// ~1000×700 of the world). Ordered so the first few are opposite/spread for
+// small lobbies, then filled in around the perimeter up to 10 players.
 const BIG_SPAWN_FRACS = [
-  [0.12, 0.18], // far top-left
+  [0.12, 0.16], // far top-left
   [0.88, 0.84], // far bottom-right (opposite)
-  [0.86, 0.16], // far top-right
-  [0.14, 0.85], // far bottom-left
+  [0.86, 0.15], // far top-right
+  [0.14, 0.85], // far bottom-left (opposite)
   [0.5, 0.5], // centre
+  [0.5, 0.12], // top-mid
+  [0.5, 0.88], // bottom-mid
+  [0.12, 0.5], // left-mid
+  [0.88, 0.5], // right-mid
+  [0.3, 0.32], // inner offset
 ];
 
 const DEFAULT_CONFIGS: PlayerConfig[] = [
   { id: 'player-tank', name: 'Player 1', control: 'wasd', color: '#38bdf8', isLocal: true, tankClass: 'assault' },
 ];
+
+/** Scatter cover across the world: a mix of destructible crates and solid rocks,
+ *  kept clear of spawn points and not heavily overlapping each other. */
+function makeObstacles(worldW: number, worldH: number, count: number): Obstacle[] {
+  const big = worldW > CANVAS_WIDTH;
+  const spawns = big
+    ? BIG_SPAWN_FRACS.map((f) => ({ x: f[0] * worldW, y: f[1] * worldH }))
+    : [{ x: worldW / 2, y: worldH - 100 }];
+  const obs: Obstacle[] = [];
+  let tries = 0;
+  while (obs.length < count && tries < count * 25) {
+    tries++;
+    const crate = Math.random() < 0.62;
+    const w = crate ? 40 + Math.random() * 16 : 54 + Math.random() * 46;
+    const h = crate ? w : 40 + Math.random() * 42;
+    const x = 130 + Math.random() * (worldW - 260);
+    const y = 130 + Math.random() * (worldH - 260);
+    if (spawns.some((s) => Math.hypot(s.x - x, s.y - y) < 420)) continue; // keep spawns clear
+    if (obs.some((o) => Math.abs(o.x - x) < (o.w + w) / 2 + 28 && Math.abs(o.y - y) < (o.h + h) / 2 + 28)) continue;
+    const hp = crate ? 30 : 0;
+    obs.push({ id: `o${obs.length}`, x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(h), kind: crate ? 'crate' : 'rock', health: hp, maxHealth: hp });
+  }
+  return obs;
+}
+
+/** Push a tank (circle of radius r) out of an axis-aligned obstacle rect. */
+function pushOutOfObstacle(t: { x: number; y: number }, o: Obstacle, r: number) {
+  const hw = o.w / 2;
+  const hh = o.h / 2;
+  const cx = Math.max(o.x - hw, Math.min(t.x, o.x + hw));
+  const cy = Math.max(o.y - hh, Math.min(t.y, o.y + hh));
+  const dx = t.x - cx;
+  const dy = t.y - cy;
+  const dist = Math.hypot(dx, dy);
+  if (dist >= r) return;
+  if (dist > 0.0001) {
+    const push = r - dist;
+    t.x += (dx / dist) * push;
+    t.y += (dy / dist) * push;
+  } else {
+    // Centre is inside the rect — eject along the shallowest edge.
+    const left = t.x - (o.x - hw);
+    const right = o.x + hw - t.x;
+    const top = t.y - (o.y - hh);
+    const bottom = o.y + hh - t.y;
+    const minH = Math.min(left, right);
+    const minV = Math.min(top, bottom);
+    if (minH < minV) t.x += left < right ? -(left + r) : right + r;
+    else t.y += top < bottom ? -(top + r) : bottom + r;
+  }
+}
 
 /** Build a player tank for a slot, applying its class loadout, at a spawn point. */
 function makePlayer(
@@ -324,9 +420,35 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
   // (the component is keyed by gameId, so it remounts per match).
   const WORLD_W = online ? BIG_WORLD.w : CANVAS_WIDTH;
   const WORLD_H = online ? BIG_WORLD.h : CANVAS_HEIGHT;
+  // ION STORM — shrinking safe-zone, online versus only. Starts covering the
+  // whole world, then closes in phases (grace → shrink), dealing escalating
+  // out-of-zone damage so the huge map can't be camped.
+  const stormCx = WORLD_W / 2;
+  const stormCy = WORLD_H / 2;
+  const stormFull = Math.hypot(WORLD_W / 2, WORLD_H / 2) + 60;
   const stateRef = useRef({
     worldW: WORLD_W,
     worldH: WORLD_H,
+    obstacles: makeObstacles(WORLD_W, WORLD_H, online ? 46 : 10),
+    fireAlerts: [] as FireAlert[],
+    storm: {
+      active: online && matchMode === 'versus',
+      cx: stormCx,
+      cy: stormCy,
+      radius: stormFull,
+      fromR: stormFull,
+      fromCx: stormCx,
+      fromCy: stormCy,
+      toR: stormFull * 0.6,
+      toCx: stormCx,
+      toCy: stormCy,
+      state: 'grace' as 'grace' | 'shrink',
+      timer: 0,
+      grace: 14000,
+      shrink: 18000,
+      damage: 3,
+      minR: 300,
+    },
     score: 0,
     lastBossScore: 0,
     combo: 0,
@@ -630,6 +752,71 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
       endMatch('');
     }
   }, [endMatch]);
+
+  // ION STORM — advance the shrinking safe-zone and damage anyone caught outside.
+  const updateStorm = useCallback((delta: number) => {
+    const st = stateRef.current.storm;
+    if (!st.active) return;
+    st.timer += delta;
+    if (st.state === 'grace') {
+      if (st.timer >= st.grace) {
+        st.state = 'shrink';
+        st.timer = 0;
+        st.fromR = st.radius;
+        st.fromCx = st.cx;
+        st.fromCy = st.cy;
+      }
+    } else {
+      const k = Math.min(1, st.timer / st.shrink);
+      st.radius = st.fromR + (st.toR - st.fromR) * k;
+      st.cx = st.fromCx + (st.toCx - st.fromCx) * k;
+      st.cy = st.fromCy + (st.toCy - st.fromCy) * k;
+      if (k >= 1) {
+        // Ring closed — pause, ramp damage, plan a smaller ring inside this one.
+        st.state = 'grace';
+        st.timer = 0;
+        st.damage *= 1.5;
+        const prevR = st.toR;
+        const nextR = Math.max(st.minR, prevR * 0.58);
+        const maxOff = Math.max(0, prevR - nextR);
+        const ang = Math.random() * Math.PI * 2;
+        const off = Math.random() * maxOff;
+        st.toR = nextR;
+        st.toCx = st.cx + Math.cos(ang) * off;
+        st.toCy = st.cy + Math.sin(ang) * off;
+      }
+    }
+    // Out-of-zone damage (escalates each phase) → feeds the last-standing check.
+    const dmg = st.damage * (delta / 1000);
+    for (const p of stateRef.current.players) {
+      if (p.health <= 0) continue;
+      if (Math.hypot(p.x - st.cx, p.y - st.cy) > st.radius) p.health -= dmg;
+    }
+  }, []);
+
+  // Keep every living tank out of solid cover (run after movement each frame).
+  const resolveObstacles = useCallback(() => {
+    const s = stateRef.current;
+    if (!s.obstacles.length) return;
+    const tanks = [...s.players, ...s.enemies];
+    for (const t of tanks) {
+      if (t.health <= 0) continue;
+      const r = t.width * 0.42;
+      for (const o of s.obstacles) pushOutOfObstacle(t, o, r);
+    }
+  }, []);
+
+  // A crate was destroyed → spawn an energy cell (charges ultimates — the main
+  // energy source in versus, where there are no AI kills) + a burst.
+  const destroyCrate = useCallback((o: Obstacle) => {
+    const s = stateRef.current;
+    s.explosions.push({ x: o.x, y: o.y, radius: 5, maxRadius: 95, opacity: 1, fadeSpeed: 0.06, color: '#f59e0b' });
+    createParticles(o.x, o.y, '#d97706', 16, 'spark');
+    s.energyCells.push({ id: Math.random().toString(36).substring(2, 10), x: o.x, y: o.y, radius: 14, lifespan: 600, opacity: 1 });
+    s.obstacles = s.obstacles.filter((ob) => ob.id !== o.id);
+    s.screenShake = Math.max(s.screenShake, 6);
+    audioService.playHit();
+  }, [createParticles]);
 
   const requestSpawn = useCallback((type: EnemyType) => {
     // Online is pure battle-royale PvP for now — no AI waves. (Solo / local keep them.)
@@ -990,6 +1177,12 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
           fireBullet(p, true);
         }
         p.lastShot = Date.now();
+        // Emit a gunshot proximity ping (throttled) so nearby enemies are warned.
+        if (Date.now() - (p.lastFireAlert ?? 0) > 220) {
+          p.lastFireAlert = Date.now();
+          s.fireAlerts.push({ x: p.x, y: p.y, ownerId: p.id, life: 42, maxLife: 42 });
+          if (s.fireAlerts.length > 40) s.fireAlerts.shift();
+        }
       }
 
       // ── Ultimate ──────────────────────────────────────────────────────
@@ -1174,6 +1367,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
 
     // RESOLVE TANK COLLISIONS
     resolveTankCollisions();
+    resolveObstacles();
 
     // Bound Checks after collision resolution
     for (const p of s.players) {
@@ -1250,6 +1444,23 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
       b.x += b.dx; b.y += b.dy;
       b.trailHistory.push({x: b.x, y: b.y});
       if (b.trailHistory.length > 25) b.trailHistory.shift();
+
+      // Cover blocks projectiles — crates take damage (and drop energy when
+      // destroyed), rocks just absorb. (The railgun laser pierces cover instead.)
+      for (const o of s.obstacles) {
+        if (Math.abs(b.x - o.x) < o.w / 2 + b.radius && Math.abs(b.y - o.y) < o.h / 2 + b.radius) {
+          bToRemove.add(b.id);
+          if (o.kind === 'crate') {
+            o.health -= b.damage;
+            createParticles(b.x, b.y, '#fbbf24', 8, 'spark');
+            if (o.health <= 0) destroyCrate(o);
+          } else {
+            createParticles(b.x, b.y, '#94a3b8', 6, 'spark');
+          }
+          break;
+        }
+      }
+      if (bToRemove.has(b.id)) return; // blocked by cover
 
       if (b.isAllied) {
         // Versus: a player's bullet damages OTHER players (never its owner).
@@ -1332,7 +1543,9 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     });
     s.energyCells = s.energyCells.filter((i) => i.lifespan > 0);
 
-    const nukeIdx = inputs.findIndex((i) => i.nuke);
+    // NUKE + AIR STRIKE are co-op-only. In versus they'd let one player wipe the
+    // whole map, so they're disabled — PvP relies on the energy-gated ultimate.
+    const nukeIdx = versusRef.current ? -1 : inputs.findIndex((i) => i.nuke);
     if (nukeIdx >= 0 && s.nukeCounter >= NUKE_TARGET) {
       const origin = s.players[nukeIdx] ?? s.players[0];
       s.nukeCounter = 0; s.screenShake = 150; s.screenFlash = 1.0;
@@ -1343,7 +1556,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
       onStateUpdate({ nukeReady: false, nukeProgress: 0 });
     }
 
-    const bomberIdx = inputs.findIndex((i) => i.bomber);
+    const bomberIdx = versusRef.current ? -1 : inputs.findIndex((i) => i.bomber);
     if (bomberIdx >= 0 && s.bomberCounter >= BOMBER_TARGET && !s.bomber.active) {
       const origin = s.players[bomberIdx] ?? s.players[0];
       s.bomberCounter = 0; s.bomber.active = true; s.bomber.x = -600; s.bomber.y = origin.y; s.bomber.lastDropX = -600;
@@ -1363,9 +1576,11 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
       if (s.bomber.x > CANVAS_WIDTH + 1000) s.bomber.active = false;
     }
 
-    // Climate & Environmental Shifts (every 25 seconds)
+    // Climate & Environmental Shifts (every 30s). Skipped online — the big
+    // battle-royale map uses the ION STORM as its environmental mechanic, and the
+    // heavy weather vision-shroud reads as an ugly grey box on the scrolled world.
     s.weatherTimer += delta;
-    if (s.weatherTimer > 30000) { // Slight increase to 30s to let players adapt
+    if (!onlineRef.current && s.weatherTimer > 30000) { // Slight increase to 30s to let players adapt
       s.weatherTimer = 0;
       
       const weathers = Object.values(WeatherType);
@@ -1463,6 +1678,9 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
       }
     }
 
+    s.fireAlerts.forEach((a) => a.life--);
+    s.fireAlerts = s.fireAlerts.filter((a) => a.life > 0);
+
     s.explosions.forEach(exp => { exp.radius += 16; exp.opacity -= exp.fadeSpeed; });
     s.explosions = s.explosions.filter(exp => exp.opacity > 0);
     s.particles.forEach(p => { p.x += p.dx; p.y += p.dy; p.lifespan--; p.opacity -= 0.025; });
@@ -1480,6 +1698,9 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     }
 
     if (s.combo > 0 && Date.now() - s.lastComboTime > COMBO_TIMEOUT) { s.combo = 0; onStateUpdate({ combo: 0 }); }
+
+    // ION STORM closes in and damages out-of-zone tanks (online versus).
+    updateStorm(delta);
 
     // Win condition (co-op: all down · versus: last tank standing).
     checkGameOver();
@@ -1509,7 +1730,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
         ultName: ULTIMATES[p0.tankClass].label,
       });
     }
-  }, [onStateUpdate, status, onGameOver, spawnSpecificEnemy, fireBullet, onEnemyKill, initiateReload, createParticles, fireAutoSwarm, requestSpawn, resolveTankCollisions, checkGameOver, damagePlayersRadius, damagePlayersRay]);
+  }, [onStateUpdate, status, onGameOver, spawnSpecificEnemy, fireBullet, onEnemyKill, initiateReload, createParticles, fireAutoSwarm, requestSpawn, resolveTankCollisions, checkGameOver, damagePlayersRadius, damagePlayersRay, updateStorm, resolveObstacles, destroyCrate]);
 
   const drawTank = (ctx: CanvasRenderingContext2D, t: Tank) => {
     ctx.save(); ctx.translate(t.x, t.y);
@@ -1795,6 +2016,17 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
       bomberProgress: Math.min(100, (cs.bomberCounter / BOMBER_TARGET) * 100),
       bomberReady: cs.bomberCounter >= BOMBER_TARGET,
       arena: { w: cs.worldW, h: cs.worldH },
+      obstacles: cs.obstacles,
+      fireAlerts: cs.fireAlerts,
+      storm: {
+        active: cs.storm.active,
+        cx: cs.storm.cx,
+        cy: cs.storm.cy,
+        radius: cs.storm.radius,
+        toCx: cs.storm.toCx,
+        toCy: cs.storm.toCy,
+        toR: cs.storm.toR,
+      },
     };
   }, []);
 
@@ -2079,8 +2311,10 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
           }
 
           // Predict OUR tank locally so it responds instantly (others stay interpolated).
+          // Skip while dead — no point steering a corpse (the camera spectates instead).
           let input: PlayerInput = EMPTY_INPUT;
-          if (statusRef.current === 'playing') {
+          const localAlive = (snap.players.find((pl) => pl.id === localIdRef.current)?.health ?? 1) > 0;
+          if (statusRef.current === 'playing' && localAlive) {
             if (!predictedSelfRef.current && authMe) {
               predictedSelfRef.current = { x: authMe.x, y: authMe.y, angle: authMe.angle, turretAngle: authMe.turretAngle, velocity: { x: 0, y: 0 } };
             }
@@ -2088,6 +2322,9 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
             if (pred) {
               input = sampleLocalInput(stateRef.current.keys, worldMouseFor(pred), pred, directRef.current);
               advanceTankMovement(pred, input, computeEnv(snap.weather, snap.terrain));
+              // Predicted local tank respects cover too (avoids rubber-banding at crates).
+              const meWidth = snap.players.find((pl) => pl.id === localIdRef.current)?.width ?? 50;
+              for (const o of snap.obstacles ?? []) pushOutOfObstacle(pred, o, meWidth * 0.42);
               pred.x = Math.max(30, Math.min(stateRef.current.worldW - 30, pred.x));
               pred.y = Math.max(30, Math.min(stateRef.current.worldH - 30, pred.y));
               if (authMe) {

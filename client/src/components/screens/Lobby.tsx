@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { useShell } from '../../state/AppShellContext';
-import { useNet } from '../../state/NetContext';
+import { useNet, MAX_PLAYERS } from '../../state/NetContext';
 import { createOnlineMatchConfig } from '../../state/matchConfig';
 import type { TankClass, MatchMode } from '../../types';
 import { TANK_CLASSES } from '../../constants';
@@ -229,7 +229,7 @@ export const Lobby: React.FC = () => {
         )}
       </div>
       <p className="mt-4 text-xs text-slate-600">
-        {mode === 'versus' ? 'Versus · huge map · last tank standing' : 'Co-op vs AI'} · the host runs the match · {net.players.length}/{5} pilots.
+        {mode === 'versus' ? 'Versus · huge map · last tank standing' : 'Co-op vs AI'} · the host runs the match · {net.players.length}/{MAX_PLAYERS} pilots.
       </p>
     </div>
   );

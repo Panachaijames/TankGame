@@ -194,7 +194,7 @@ const GameRoot: React.FC = () => {
             directControls={settings.movementMode === 'direct'}
             matchMode={shell.match?.mode ?? 'coop'}
           />
-          <HUD state={gameState} />
+          <HUD state={gameState} versus={shell.match?.mode === 'versus'} />
           <TopMenuBar config={shell.match} onPause={togglePause} />
           {gameState.status === 'paused' && shell.overlay === null && (
             <PauseMenu

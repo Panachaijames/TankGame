@@ -11,6 +11,9 @@ export type Quality = 'low' | 'medium' | 'high';
 // The viewport (canvas) size — the window onto the (possibly larger) world.
 const VIEW_W = 1000;
 const VIEW_H = 700;
+// Earshot for gunshot proximity alerts — a bit beyond projectile range so you
+// get warned slightly before bullets arrive, without revealing the whole map.
+const HEAR_RANGE = 1700;
 
 interface TankView {
   container: Container;
@@ -28,12 +31,14 @@ const TERRAIN = {
   [TerrainType.Snow]: { ground: 0x111827, grid: 0xbae6fd, accent: 0xbae6fd },
 } as const;
 
-// Weather shroud: tint, vision radius, opacity (mirrors the original radial vignette).
+// Weather shroud: tint, vision radius, opacity. Kept soft/atmospheric — a heavy
+// shroud reads as a flat grey box rather than weather. (Solo/local only; online
+// has no weather — the ION STORM is its environmental mechanic.)
 const WEATHER: Partial<Record<WeatherType, { tint: number; rad: number; alpha: number }>> = {
-  [WeatherType.Fog]: { tint: 0x080a0f, rad: 260, alpha: 0.97 },
-  [WeatherType.Sandstorm]: { tint: 0x4a3014, rad: 310, alpha: 0.93 },
-  [WeatherType.Snowstorm]: { tint: 0xbfdbfe, rad: 230, alpha: 0.9 },
-  [WeatherType.Rain]: { tint: 0x0a0f19, rad: 410, alpha: 0.88 },
+  [WeatherType.Fog]: { tint: 0x080a0f, rad: 330, alpha: 0.6 },
+  [WeatherType.Sandstorm]: { tint: 0x4a3014, rad: 360, alpha: 0.55 },
+  [WeatherType.Snowstorm]: { tint: 0xcfe6ff, rad: 330, alpha: 0.42 },
+  [WeatherType.Rain]: { tint: 0x0a0f19, rad: 450, alpha: 0.5 },
 };
 
 function tankColors(t: Tank): { fill: number; stroke: number | string; cone: number | string } {
@@ -57,23 +62,29 @@ export class PixiRenderer {
   private groundGlow!: Sprite;
   private decals!: Graphics;
   private repair!: Graphics;
+  private obstacles!: Graphics; // cover/crates (world space, below tanks)
   private fx!: Container; // bloomed
   private tankLayer!: Container;
   private bullets!: Graphics;
   private beamGfx!: Graphics;
   private explosions!: Graphics;
   private particles!: Graphics;
+  private stormGfx!: Graphics; // ION STORM ring (world space, above fx, no bloom)
+  private fireAlertGfx!: Graphics; // gunshot pings, on-screen (world space)
   private overlay!: Container; // not shaken
   private vignette!: Sprite;
   private weatherTint!: Graphics;
   private weatherSprite!: Sprite;
   private flash!: Graphics;
+  private stormDanger!: Graphics; // red out-of-zone warning (screen space)
+  private fireAlertEdge!: Graphics; // off-screen gunshot direction markers (screen space)
   private textLayer!: Container;
   private minimap!: Graphics;
 
   // Current follow-camera offset (world coords of the viewport's top-left).
   private camX = 0;
   private camY = 0;
+  private viewTarget: Tank | null = null; // who the camera follows (spectates if local is dead)
 
   private ringTex!: Texture;
   private dotTex!: Texture;
@@ -121,7 +132,8 @@ export class PixiRenderer {
     this.groundGlow.blendMode = 'add';
     this.decals = new Graphics();
     this.repair = new Graphics();
-    this.ground.addChild(this.bg, this.groundGlow, this.decals, this.repair);
+    this.obstacles = new Graphics();
+    this.ground.addChild(this.bg, this.groundGlow, this.decals, this.repair, this.obstacles);
     this.world.addChild(this.ground);
 
     this.fx = new Container();
@@ -132,6 +144,14 @@ export class PixiRenderer {
     this.particles = new Graphics();
     this.fx.addChild(this.explosions, this.tankLayer, this.bullets, this.beamGfx, this.particles);
     this.world.addChild(this.fx);
+
+    // ION STORM ring sits above the bloomed fx, in world space (scrolls w/ camera).
+    this.stormGfx = new Graphics();
+    this.world.addChild(this.stormGfx);
+
+    // On-screen gunshot pings (world space, above the storm ring).
+    this.fireAlertGfx = new Graphics();
+    this.world.addChild(this.fireAlertGfx);
 
     if (this.quality !== 'low') this.fx.filters = [this.makeBloom(this.quality)];
     // Pin the bloom filter region (avoids Pixi crashing on the huge off-screen
@@ -165,6 +185,14 @@ export class PixiRenderer {
     this.flash = new Graphics();
     this.overlay.addChild(this.flash);
 
+    // Out-of-zone danger tint (screen space).
+    this.stormDanger = new Graphics();
+    this.overlay.addChild(this.stormDanger);
+
+    // Off-screen gunshot direction markers (screen space).
+    this.fireAlertEdge = new Graphics();
+    this.overlay.addChild(this.fireAlertEdge);
+
     this.textLayer = new Container();
     this.overlay.addChild(this.textLayer);
 
@@ -195,18 +223,22 @@ export class PixiRenderer {
     this.time++;
 
     // Follow camera: centre the local tank on the big world (a no-op {0,0} on
-    // the small arena). The world container scrolls; shake rides on top.
-    const target = snap.player ?? snap.players[0];
+    // the small arena). If the local tank is dead, spectate a living one.
+    const me = snap.player ?? snap.players[0];
+    const target = me && me.health > 0 ? me : snap.players.find((p) => p.health > 0) ?? me;
+    this.viewTarget = target ?? null;
     const cam = target
       ? cameraOffset(target.x, target.y, snap.arena.w, snap.arena.h)
       : { x: 0, y: 0 };
     this.camX = cam.x;
     this.camY = cam.y;
     // Re-anchor the bloom region to the visible viewport (filterArea is in the
-    // fx layer's local/world space, which the camera scrolls by -cam).
+    // fx layer's local/world space, which the camera scrolls by -cam). Integer
+    // coords keep the bloom render-texture size stable (fractional ones can round
+    // to a degenerate texture and crash AdvancedBloom).
     if (this.fx.filterArea) {
-      this.fx.filterArea.x = cam.x - 120;
-      this.fx.filterArea.y = cam.y - 120;
+      this.fx.filterArea.x = Math.round(cam.x) - 120;
+      this.fx.filterArea.y = Math.round(cam.y) - 120;
     }
     let shx = 0;
     let shy = 0;
@@ -220,6 +252,7 @@ export class PixiRenderer {
 
     this.drawBackground(snap);
     this.drawDecals(snap);
+    this.drawObstacles(snap);
     this.drawRepair(snap);
     this.syncTanks(snap);
     this.drawBullets(snap);
@@ -227,6 +260,8 @@ export class PixiRenderer {
     this.drawExplosions(snap);
     this.drawParticles(snap);
     this.drawWeather(snap);
+    this.drawStorm(snap);
+    this.drawFireAlerts(snap);
     this.drawFloatingText(snap);
     this.drawMinimap(snap);
 
@@ -235,7 +270,21 @@ export class PixiRenderer {
       this.flash.rect(0, 0, VIEW_W, VIEW_H).fill({ color: 0xffffff, alpha: snap.screenFlash });
     }
 
-    this.app.render();
+    // Safety net: a filter (AdvancedBloom) must never throw out of the render
+    // loop and freeze the whole game. If it does, drop bloom and carry on flat.
+    try {
+      this.app.render();
+    } catch (e) {
+      if (this.fx.filters && this.fx.filters.length) {
+        this.fx.filters = [];
+        try {
+          this.app.render();
+        } catch {
+          /* ignore — frame skipped */
+        }
+        console.warn('[hypertank] bloom disabled after a filter error', e);
+      }
+    }
   }
 
   private drawBackground(snap: WorldSnapshot) {
@@ -270,7 +319,7 @@ export class PixiRenderer {
     // Tint the soft ground glow to the biome accent; keep it under the player
     // (on the big world it would otherwise sit far away at the world origin).
     this.groundGlow.tint = t.accent;
-    const tgt = snap.player ?? snap.players[0];
+    const tgt = this.viewTarget ?? snap.player ?? snap.players[0];
     if (tgt) this.groundGlow.position.set(tgt.x, tgt.y);
 
     this.lastTerrain = snap.terrain;
@@ -284,6 +333,29 @@ export class PixiRenderer {
       const cy = Math.sin(tm.angle) * 5;
       g.moveTo(tm.x - cx, tm.y - cy).lineTo(tm.x + cx, tm.y + cy);
       g.stroke({ width: tm.width, color: tm.color, alpha: tm.opacity });
+    }
+  }
+
+  private drawObstacles(snap: WorldSnapshot) {
+    const g = this.obstacles;
+    g.clear();
+    for (const o of snap.obstacles ?? []) {
+      const x = o.x - o.w / 2;
+      const y = o.y - o.h / 2;
+      if (o.kind === 'crate') {
+        // Amber supply crate (energy hint), darkening + cracking as it's shot.
+        const dmg = o.maxHealth > 0 ? Math.max(0, 1 - o.health / o.maxHealth) : 0;
+        g.roundRect(x, y, o.w, o.h, 4).fill({ color: 0x7a5526, alpha: 0.95 }).stroke({ width: 2, color: 0xd9a441, alpha: 0.9 });
+        g.moveTo(x + 3, y + 3).lineTo(x + o.w - 3, y + o.h - 3)
+          .moveTo(x + o.w - 3, y + 3).lineTo(x + 3, y + o.h - 3)
+          .stroke({ width: 2, color: 0x3f2d16, alpha: 0.6 });
+        g.circle(o.x, o.y, 4).fill({ color: 0xfde047, alpha: 0.85 });
+        if (dmg > 0.05) g.roundRect(x, y, o.w, o.h, 4).fill({ color: 0xef4444, alpha: dmg * 0.4 });
+      } else {
+        // Solid rock cover.
+        g.roundRect(x, y, o.w, o.h, 8).fill({ color: 0x39414f, alpha: 0.96 }).stroke({ width: 2, color: 0x64748b, alpha: 0.8 });
+        g.circle(o.x - o.w * 0.16, o.y - o.h * 0.14, Math.min(o.w, o.h) * 0.17).fill({ color: 0x4b5563, alpha: 0.55 });
+      }
     }
   }
 
@@ -366,18 +438,48 @@ export class PixiRenderer {
       .lineTo(w / 2 + coneLen, h * 1.1)
       .lineTo(w / 2, h * 0.35)
       .fill({ color: cone, alpha: 0.05 });
-    // Treads.
-    g.roundRect(-w / 2, -h / 2 - 3, w, 7, 3).fill(0x0b1220);
-    g.roundRect(-w / 2, h / 2 - 4, w, 7, 3).fill(0x0b1220);
-    // Hull.
-    g.roundRect(-w / 2 + 3, -h / 2 + 2, w - 6, h - 4, 6)
-      .fill(fill)
-      .stroke({ width: 3, color: stroke, alpha: 0.95 });
-    // Front-facing chevron (reads chassis orientation at a glance).
-    g.moveTo(w / 2 - 6, -h / 3)
-      .lineTo(w / 2 + 2, 0)
-      .lineTo(w / 2 - 6, h / 3)
-      .stroke({ width: 2, color: stroke, alpha: 0.85 });
+
+    const cls = t.type === 'player' ? t.tankClass ?? 'assault' : null;
+
+    if (cls === 'vanguard') {
+      // Heavy brawler: wide hull, fat treads, bolted side armour plates, rivets.
+      g.roundRect(-w / 2 - 2, -h / 2 - 4, w + 4, 9, 3).fill(0x0b1220);
+      g.roundRect(-w / 2 - 2, h / 2 - 5, w + 4, 9, 3).fill(0x0b1220);
+      g.roundRect(-w / 2 + 2, -h / 2 + 2, w - 4, h - 4, 3).fill(fill).stroke({ width: 3.5, color: stroke, alpha: 0.95 });
+      g.rect(-w / 2 + 7, -h / 2 - 1, w - 14, 5).fill({ color: 0x0f172a, alpha: 0.75 });
+      g.rect(-w / 2 + 7, h / 2 - 4, w - 14, 5).fill({ color: 0x0f172a, alpha: 0.75 });
+      g.rect(w / 2 - 8, -h / 2 + 6, 6, h - 12).fill({ color: stroke, alpha: 0.3 }); // frontal armour
+      for (const [rx, ry] of [[-w / 2 + 8, -h / 2 + 7], [w / 2 - 10, -h / 2 + 7], [-w / 2 + 8, h / 2 - 7], [w / 2 - 10, h / 2 - 7]] as const) {
+        g.circle(rx, ry, 1.6).fill({ color: stroke, alpha: 0.7 });
+      }
+    } else if (cls === 'sniper') {
+      // Glass-cannon dart: narrow pointed hull with swept-back fins.
+      g.roundRect(-w / 2, -h / 2 - 2, w, 5, 2).fill(0x0b1220);
+      g.roundRect(-w / 2, h / 2 - 3, w, 5, 2).fill(0x0b1220);
+      g.poly([-w / 2 + 2, -h / 2 + 2, -w / 2 - 7, -h / 2 - 7, -w / 2 + 12, -h * 0.08]).fill({ color: fill, alpha: 0.92 }).stroke({ width: 1.5, color: stroke, alpha: 0.7 });
+      g.poly([-w / 2 + 2, h / 2 - 2, -w / 2 - 7, h / 2 + 7, -w / 2 + 12, h * 0.08]).fill({ color: fill, alpha: 0.92 }).stroke({ width: 1.5, color: stroke, alpha: 0.7 });
+      g.poly([-w / 2 + 5, -h / 2 + 5, w / 2 - 2, -h / 2 + 9, w / 2 + 9, 0, w / 2 - 2, h / 2 - 9, -w / 2 + 5, h / 2 - 5])
+        .fill(fill)
+        .stroke({ width: 2.5, color: stroke, alpha: 0.95 });
+    } else {
+      // Assault (and AI enemies): sleek beveled battle tank with a pointed prow.
+      g.roundRect(-w / 2, -h / 2 - 3, w, 7, 3).fill(0x0b1220);
+      g.roundRect(-w / 2, h / 2 - 4, w, 7, 3).fill(0x0b1220);
+      if (cls === 'assault') {
+        g.poly([-w / 2 + 3, -h / 2 + 3, w / 2 - 9, -h / 2 + 3, w / 2 + 5, 0, w / 2 - 9, h / 2 - 3, -w / 2 + 3, h / 2 - 3])
+          .fill(fill)
+          .stroke({ width: 3, color: stroke, alpha: 0.95 });
+        g.rect(-w / 2 + 7, -h * 0.13, w * 0.46, h * 0.26).fill({ color: stroke, alpha: 0.16 });
+      } else {
+        g.roundRect(-w / 2 + 3, -h / 2 + 2, w - 6, h - 4, 6).fill(fill).stroke({ width: 3, color: stroke, alpha: 0.95 });
+      }
+      // Front-facing chevron (reads chassis orientation at a glance).
+      g.moveTo(w / 2 - 6, -h / 3)
+        .lineTo(w / 2 + 2, 0)
+        .lineTo(w / 2 - 6, h / 3)
+        .stroke({ width: 2, color: stroke, alpha: 0.85 });
+    }
+
     // Reactor core — class accent for players (bright → blooms).
     const accent = t.type === 'player' ? TANK_CLASSES[t.tankClass ?? 'assault'].accent : stroke;
     g.circle(0, 0, 9).fill({ color: accent, alpha: 0.35 });
@@ -386,19 +488,41 @@ export class PixiRenderer {
 
   private drawTurret(g: Graphics, t: Tank) {
     const { stroke } = tankColors(t);
-    const cls = t.type === 'player' ? TANK_CLASSES[t.tankClass ?? 'assault'] : null;
-    const accent = cls ? cls.accent : stroke;
-    const barrelLen = t.width * (cls ? cls.barrelLen : 0.72);
-    const barrelW = Math.max(4, t.width * (cls ? cls.barrelW : 0.13));
+    const w = t.width;
+    const cls = t.type === 'player' ? t.tankClass ?? 'assault' : null;
+    const accent = cls ? TANK_CLASSES[cls].accent : stroke;
     g.clear();
-    g.roundRect(0, -barrelW / 2, barrelLen, barrelW, 2)
-      .fill(0x1e293b)
-      .stroke({ width: 1.5, color: stroke, alpha: 0.8 });
-    // Muzzle accent (class colour) at the barrel tip.
-    g.roundRect(barrelLen - 4, -barrelW / 2, 4, barrelW, 1).fill(accent);
-    g.circle(0, 0, t.width * 0.3)
-      .fill(0x0f172a)
-      .stroke({ width: 2.5, color: stroke, alpha: 0.95 });
+
+    if (cls === 'vanguard') {
+      // Twin stubby auto-cannons (the bullet-hose), blocky turret.
+      const bl = w * 0.56;
+      const bw = Math.max(4, w * 0.12);
+      for (const oy of [-w * 0.17, w * 0.17]) {
+        g.roundRect(0, oy - bw / 2, bl, bw, 2).fill(0x1e293b).stroke({ width: 1.5, color: stroke, alpha: 0.8 });
+        g.roundRect(bl - 4, oy - bw / 2, 4, bw, 1).fill(accent);
+      }
+      g.roundRect(-w * 0.3, -w * 0.3, w * 0.6, w * 0.6, 3).fill(0x0f172a).stroke({ width: 2.5, color: stroke, alpha: 0.95 });
+    } else if (cls === 'sniper') {
+      // Long railgun barrel with charge coils + a sleek mount.
+      const bl = w * 1.18;
+      const bw = Math.max(3, w * 0.09);
+      g.roundRect(0, -bw / 2, bl, bw, 1).fill(0x1e293b).stroke({ width: 1.5, color: stroke, alpha: 0.8 });
+      for (let i = 1; i <= 3; i++) {
+        const cx = bl * 0.22 * i;
+        g.rect(cx - 2, -bw * 1.7, 4, bw * 3.4).fill({ color: accent, alpha: 0.75 });
+      }
+      g.roundRect(bl - 6, -bw / 2, 6, bw, 1).fill(0xffffff);
+      g.circle(0, 0, w * 0.26).fill(0x0f172a).stroke({ width: 2.5, color: stroke, alpha: 0.95 });
+    } else {
+      // Assault (and AI enemies): single barrel + offset gun-sight.
+      const cfg = cls ? TANK_CLASSES[cls] : null;
+      const bl = w * (cfg ? cfg.barrelLen : 0.72);
+      const bw = Math.max(4, w * (cfg ? cfg.barrelW : 0.13));
+      g.roundRect(0, -bw / 2, bl, bw, 2).fill(0x1e293b).stroke({ width: 1.5, color: stroke, alpha: 0.8 });
+      g.roundRect(bl - 4, -bw / 2, 4, bw, 1).fill(accent);
+      if (cls === 'assault') g.rect(-w * 0.04, -w * 0.34, w * 0.16, w * 0.15).fill({ color: 0x0f172a }).stroke({ width: 1.2, color: stroke, alpha: 0.7 });
+      g.circle(0, 0, w * 0.3).fill(0x0f172a).stroke({ width: 2.5, color: stroke, alpha: 0.95 });
+    }
     g.circle(0, 0, 3).fill(accent);
   }
 
@@ -511,15 +635,15 @@ export class PixiRenderer {
       return;
     }
     // Full-screen colour grade for mood (overlay is screen-space → viewport-sized).
-    this.weatherTint.rect(0, 0, VIEW_W, VIEW_H).fill({ color: cfg.tint, alpha: 0.2 });
-    // Softened radial vision limit centred on the local player. The overlay is
+    this.weatherTint.rect(0, 0, VIEW_W, VIEW_H).fill({ color: cfg.tint, alpha: 0.12 });
+    // Softened radial vision limit centred on the viewed player. The overlay is
     // screen-space, so place it at the player's on-screen position (world − cam).
-    const p = snap.player ?? snap.players[0];
+    const p = this.viewTarget ?? snap.player ?? snap.players[0];
     this.weatherSprite.visible = true;
     this.weatherSprite.position.set(p.x - this.camX, p.y - this.camY);
-    this.weatherSprite.scale.set((cfg.rad * 1.3) / 128);
+    this.weatherSprite.scale.set((cfg.rad * 1.6) / 128);
     this.weatherSprite.tint = cfg.tint;
-    this.weatherSprite.alpha = cfg.alpha * 0.72;
+    this.weatherSprite.alpha = cfg.alpha * 0.55;
   }
 
   private drawFloatingText(snap: WorldSnapshot) {
@@ -547,6 +671,64 @@ export class PixiRenderer {
     for (let i = list.length; i < this.textPool.length; i++) this.textPool[i].visible = false;
   }
 
+  private drawStorm(snap: WorldSnapshot) {
+    const st = snap.storm;
+    this.stormGfx.clear();
+    this.stormDanger.clear();
+    if (!st || !st.active) return;
+    // Current safe-zone boundary (pulsing cyan).
+    const pulse = 0.4 + 0.18 * Math.sin(this.time * 0.08);
+    this.stormGfx.circle(st.cx, st.cy, st.radius).stroke({ width: 8, color: 0x38bdf8, alpha: pulse });
+    this.stormGfx.circle(st.cx, st.cy, st.radius).stroke({ width: 2, color: 0xe0f2fe, alpha: pulse + 0.2 });
+    // Where the zone is closing to next (magenta).
+    if (st.toR < st.radius - 5) {
+      this.stormGfx.circle(st.toCx, st.toCy, st.toR).stroke({ width: 3, color: 0xf472b6, alpha: 0.5 });
+    }
+    // Pulsing red wash when the local tank is outside the zone (taking damage).
+    const p = snap.player ?? snap.players[0];
+    if (p && Math.hypot(p.x - st.cx, p.y - st.cy) > st.radius) {
+      const a = 0.13 + 0.06 * Math.sin(this.time * 0.2);
+      this.stormDanger.rect(0, 0, VIEW_W, VIEW_H).fill({ color: 0xef4444, alpha: a });
+    }
+  }
+
+  private drawFireAlerts(snap: WorldSnapshot) {
+    const g = this.fireAlertGfx; // world space (on-screen pings)
+    const e = this.fireAlertEdge; // screen space (off-screen direction markers)
+    g.clear();
+    e.clear();
+    const local = snap.player ?? snap.players[0];
+    if (!local) return;
+    for (const a of snap.fireAlerts ?? []) {
+      if (a.ownerId === local.id) continue; // not your own shots
+      const dx = a.x - local.x;
+      const dy = a.y - local.y;
+      if (Math.hypot(dx, dy) > HEAR_RANGE) continue; // only gunfire within earshot
+
+      const t = a.maxLife > 0 ? a.life / a.maxLife : 1; // 1 → 0 as it fades
+      const sx = a.x - this.camX;
+      const sy = a.y - this.camY;
+      const onScreen = sx > 20 && sx < VIEW_W - 20 && sy > 86 && sy < VIEW_H - 20;
+      if (onScreen) {
+        const r = (1 - t) * 30 + 8;
+        g.circle(a.x, a.y, r).stroke({ width: 3, color: 0xfb923c, alpha: t * 0.85 });
+        g.circle(a.x, a.y, r * 0.5).stroke({ width: 1.5, color: 0xfdba74, alpha: t * 0.5 });
+      } else {
+        // Off-screen: a chevron at the screen edge pointing toward the gunfire.
+        const ang = Math.atan2(dy, dx);
+        const ex = VIEW_W / 2 + Math.cos(ang) * (VIEW_W * 0.44);
+        const ey = VIEW_H / 2 + Math.sin(ang) * (VIEW_H * 0.4);
+        const cx = Math.max(28, Math.min(VIEW_W - 28, ex));
+        const cy = Math.max(96, Math.min(VIEW_H - 28, ey));
+        const ca = Math.cos(ang);
+        const sa = Math.sin(ang);
+        const pt = (lx: number, ly: number) => [cx + lx * ca - ly * sa, cy + lx * sa + ly * ca];
+        e.poly([...pt(12, 0), ...pt(-7, -7), ...pt(-7, 7)]).fill({ color: 0xfb923c, alpha: t * 0.9 });
+        e.circle(cx, cy, 14).stroke({ width: 1.5, color: 0xfb923c, alpha: t * 0.4 });
+      }
+    }
+  }
+
   private drawMinimap(snap: WorldSnapshot) {
     const g = this.minimap;
     g.clear();
@@ -565,14 +747,32 @@ export class PixiRenderer {
     const sx = mmW / ww;
     const sy = mmH / wh;
 
-    // Panel.
+    // Panel (fairly opaque so world content doesn't bleed through).
     g.roundRect(mx - 5, my - 5, mmW + 10, mmH + 10, 8)
-      .fill({ color: 0x05070d, alpha: 0.66 })
+      .fill({ color: 0x05070d, alpha: 0.85 })
       .stroke({ width: 1.5, color: 0x38bdf8, alpha: 0.4 });
 
     // Current viewport rectangle (what the camera shows right now).
     g.rect(mx + this.camX * sx, my + this.camY * sy, VIEW_W * sx, VIEW_H * sy)
       .stroke({ width: 1, color: 0xe2e8f0, alpha: 0.4 });
+
+    // ION STORM zone (current + next target).
+    const st = snap.storm;
+    if (st && st.active) {
+      g.circle(mx + st.cx * sx, my + st.cy * sy, st.radius * sx).stroke({ width: 1.5, color: 0x38bdf8, alpha: 0.75 });
+      if (st.toR < st.radius - 5) {
+        g.circle(mx + st.toCx * sx, my + st.toCy * sy, st.toR * sx).stroke({ width: 1, color: 0xf472b6, alpha: 0.8 });
+      }
+    }
+
+    // Nearby gunfire pings (orange) — glance-able threat awareness.
+    const localTank = snap.player ?? snap.players[0];
+    for (const a of snap.fireAlerts ?? []) {
+      if (!localTank || a.ownerId === localTank.id) continue;
+      if (Math.hypot(a.x - localTank.x, a.y - localTank.y) > HEAR_RANGE) continue;
+      const t = a.maxLife > 0 ? a.life / a.maxLife : 1;
+      g.circle(mx + a.x * sx, my + a.y * sy, 2.6).fill({ color: 0xfb923c, alpha: 0.5 + t * 0.4 });
+    }
 
     // Player blips (local player gets a white ring).
     const localId = (snap.player ?? snap.players[0])?.id;
