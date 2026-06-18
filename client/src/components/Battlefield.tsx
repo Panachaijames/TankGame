@@ -1382,18 +1382,9 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
       const dist = Math.hypot(target.x - e.x, target.y - e.y);
       const angle = Math.atan2(target.y - e.y, target.x - e.x);
 
-      // Weather-limited detection (bosses always sense the player). Long-range
-      // specialists (sniper/artillery/homing) still sense out to their own range,
-      // so they don't freeze uselessly when parked beyond the weather cap.
-      let detectsPlayer = true;
-      if (!boss) {
-        let cap = Infinity;
-        if (s.weather === WeatherType.Fog) cap = 260;
-        else if (s.weather === WeatherType.Snowstorm) cap = 240;
-        else if (s.weather === WeatherType.Sandstorm) cap = 320;
-        else if (s.weather === WeatherType.Rain) cap = 420;
-        detectsPlayer = dist < Math.max(cap, cfg.range ?? 0);
-      }
+      // Weather is purely atmospheric now — it no longer blinds enemies (that
+      // froze them idling at the map edges whenever fog/snow rolled in).
+      const detectsPlayer = true;
 
       e.aiTimer = (e.aiTimer ?? 0) + delta;
       e.shootTimer += delta;
@@ -1873,15 +1864,16 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
         });
       }
     } else if (!onlineRef.current && s.weather === WeatherType.Fog) {
-      if (Math.random() < 0.12) {
+      // Rolling cloud bank — big, soft, drifting; fills the arena over a few seconds.
+      if (Math.random() < 0.32) {
         s.particles.push({
-          x: -50,
+          x: -120,
           y: Math.random() * CANVAS_HEIGHT,
-          dx: 0.4 + Math.random() * 0.8,
+          dx: 0.7 + Math.random() * 1.1,
           dy: (Math.random() - 0.5) * 0.3,
-          radius: Math.random() * 60 + 50,
-          opacity: 0.08,
-          lifespan: 300,
+          radius: Math.random() * 130 + 120,
+          opacity: 0.13 + Math.random() * 0.05,
+          lifespan: 650,
           color: '#cbd5e1',
           type: 'smoke'
         });
@@ -1948,7 +1940,8 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
 
     s.explosions.forEach(exp => { exp.radius += 16; exp.opacity -= exp.fadeSpeed; });
     s.explosions = s.explosions.filter(exp => exp.opacity > 0);
-    s.particles.forEach(p => { p.x += p.dx; p.y += p.dy; p.lifespan--; p.opacity -= 0.025; });
+    // Smoke/fog lingers (slow fade); sparks & debris fade fast as before.
+    s.particles.forEach(p => { p.x += p.dx; p.y += p.dy; p.lifespan--; p.opacity -= p.type === 'smoke' ? 0.0016 : 0.025; });
     s.particles = s.particles.filter(p => p.lifespan > 0);
     s.floatingTexts.forEach(t => { t.y -= 2.2; t.opacity -= 0.02; t.lifespan--; });
     s.floatingTexts = s.floatingTexts.filter(t => t.lifespan > 0);

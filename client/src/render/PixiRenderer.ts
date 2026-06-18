@@ -737,20 +737,12 @@ export class PixiRenderer {
   private drawWeather(snap: WorldSnapshot) {
     const cfg = WEATHER[snap.weather];
     this.weatherTint.clear();
-    if (!cfg) {
-      this.weatherSprite.visible = false;
-      return;
-    }
-    // Full-screen colour grade for mood (overlay is screen-space → viewport-sized).
-    this.weatherTint.rect(0, 0, VIEW_W, VIEW_H).fill({ color: cfg.tint, alpha: 0.12 });
-    // Softened radial vision limit centred on the viewed player. The overlay is
-    // screen-space, so place it at the player's on-screen position (world − cam).
-    const p = this.viewTarget ?? snap.player ?? snap.players[0];
-    this.weatherSprite.visible = true;
-    this.weatherSprite.position.set(p.x - this.camX, p.y - this.camY);
-    this.weatherSprite.scale.set((cfg.rad * 1.6) / 128);
-    this.weatherSprite.tint = cfg.tint;
-    this.weatherSprite.alpha = cfg.alpha * 0.55;
+    // The old radial vision-shroud is gone — its opaque-cornered texture read as
+    // a grey rectangle (worst under Snowstorm). Weather is now just a soft,
+    // uniform full-screen colour grade for mood; particles carry the atmosphere.
+    this.weatherSprite.visible = false;
+    if (!cfg) return;
+    this.weatherTint.rect(0, 0, VIEW_W, VIEW_H).fill({ color: cfg.tint, alpha: 0.14 });
   }
 
   private drawFloatingText(snap: WorldSnapshot) {
