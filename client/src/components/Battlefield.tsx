@@ -518,6 +518,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     reportedMaxAmmo: -1,
     reportedCooldown: false,
     reportedEnergy: -1,
+    reportedHealth: -1,
     reportedUlt: false,
     spawnTimer: 0,
     difficultyTimer: 0,
@@ -1971,17 +1972,21 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
         p0.isCooldown !== s.reportedCooldown ||
         p0.maxAmmo !== s.reportedMaxAmmo ||
         p0.energy !== s.reportedEnergy ||
+        Math.ceil(p0.health) !== s.reportedHealth ||
         !!p0.ultReady !== s.reportedUlt)
     ) {
       s.reportedAmmo = p0.ammo;
       s.reportedCooldown = p0.isCooldown;
       s.reportedMaxAmmo = p0.maxAmmo;
       s.reportedEnergy = p0.energy;
+      s.reportedHealth = Math.ceil(p0.health);
       s.reportedUlt = !!p0.ultReady;
       onStateUpdate({
         ammo: p0.ammo,
         maxAmmo: p0.maxAmmo,
         isCooldown: p0.isCooldown,
+        health: Math.max(0, Math.ceil(p0.health)),
+        maxHealth: p0.maxHealth,
         energy: p0.energy,
         maxEnergy: p0.maxEnergy,
         ultReady: !!p0.ultReady,
@@ -2613,13 +2618,15 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
             adapter.sendInput(input);
             const me = snap.players.find((pl) => pl.id === localIdRef.current);
             if (me) {
-              const sig = `${me.ammo}|${me.reloading}|${me.energy}|${me.ultReady}|${snap.score}|${snap.combo}|${snap.difficulty}|${snap.weather}|${snap.nukeReady}|${snap.bomberReady}`;
+              const sig = `${me.ammo}|${me.reloading}|${Math.ceil(me.health ?? 0)}|${me.energy}|${me.ultReady}|${snap.score}|${snap.combo}|${snap.difficulty}|${snap.weather}|${snap.nukeReady}|${snap.bomberReady}`;
               if (sig !== clientHudSigRef.current) {
                 clientHudSigRef.current = sig;
                 onStateUpdate({
                   ammo: me.ammo ?? 0,
                   maxAmmo: me.maxAmmo ?? 1,
                   isCooldown: !!me.reloading,
+                  health: Math.max(0, Math.ceil(me.health ?? 0)),
+                  maxHealth: me.maxHealth ?? 100,
                   energy: me.energy ?? 0,
                   maxEnergy: me.maxEnergy ?? 100,
                   ultReady: !!me.ultReady,

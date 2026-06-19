@@ -155,6 +155,8 @@ export enum TerrainType {
 export interface GameState {
   score: number;
   difficulty: number;
+  health: number;
+  maxHealth: number;
   weather: WeatherType;
   terrain: TerrainType;
   combo: number;

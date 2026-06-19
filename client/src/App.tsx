@@ -23,6 +23,8 @@ import { createOnlineMatchConfig } from './state/matchConfig';
 const freshGameState = (difficulty: number): GameState => ({
   score: 0,
   difficulty,
+  health: 100,
+  maxHealth: 100,
   weather: WeatherType.Clear,
   terrain: TerrainType.Grassland,
   combo: 0,

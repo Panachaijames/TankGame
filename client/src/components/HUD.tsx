@@ -11,11 +11,37 @@ const HUD: React.FC<HUDProps> = ({ state, versus }) => {
   const isHighCombo = state.combo >= 10;
   const isLowAmmo = state.ammo <= 10 && !state.isCooldown;
   const nextSwarm = 10 - (state.combo % 10);
+  const hpPct = Math.max(0, Math.min(1, state.health / Math.max(1, state.maxHealth)));
+  const hpLow = hpPct <= 0.3;
   
   return (
     <div className="absolute top-0 left-0 right-0 p-4 pointer-events-none z-50 font-orbitron text-white">
       <div className="max-w-[1000px] mx-auto flex items-stretch gap-3 h-16">
-        
+
+        {/* Module 0: Hull integrity (player health) */}
+        <div className="flex-[1.1] bg-slate-900/60 backdrop-blur-xl border border-slate-700/50 rounded-xl px-4 flex items-center shadow-[0_4px_20px_rgba(0,0,0,0.4)]">
+          <div className="flex-1">
+            <div className="flex justify-between items-center mb-1">
+              <span className="text-[10px] uppercase tracking-wider text-slate-400">Hull</span>
+              <span className={`text-xs font-bold ${hpLow ? 'text-red-400 animate-pulse' : 'text-emerald-300'}`}>
+                {Math.max(0, Math.round(state.health))}/{state.maxHealth}
+              </span>
+            </div>
+            <div className="h-2.5 bg-slate-800 rounded-full overflow-hidden border border-slate-700/30">
+              <div
+                className={`h-full transition-all duration-200 ${
+                  hpPct > 0.5
+                    ? 'bg-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.5)]'
+                    : hpPct > 0.25
+                      ? 'bg-amber-500'
+                      : 'bg-red-500 animate-pulse'
+                }`}
+                style={{ width: `${hpPct * 100}%` }}
+              />
+            </div>
+          </div>
+        </div>
+
         {/* Module 1: Score & Combo */}
         <div className="flex-1 bg-slate-900/60 backdrop-blur-xl border border-slate-700/50 rounded-xl px-4 flex items-center gap-4 shadow-[0_4px_20px_rgba(0,0,0,0.4)]">
           <div className="flex flex-col">
