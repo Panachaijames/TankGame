@@ -1,4 +1,4 @@
-import type { MatchConfig, SessionKind, MatchMode, TankClass, PlayerConfig } from '../types';
+import type { MatchConfig, SessionKind, MatchMode, TankClass, PlayerConfig, MapId } from '../types';
 
 export const PLAYER_COLORS = ['#38bdf8', '#fbbf24', '#22c55e', '#a855f7', '#fb7185', '#f97316', '#14b8a6', '#e879f9', '#84cc16', '#60a5fa'];
 
@@ -7,6 +7,7 @@ export const PLAYER_COLORS = ['#38bdf8', '#fbbf24', '#22c55e', '#a855f7', '#fb71
 export function createOnlineMatchConfig(
   roster: { id: string; name: string; tankClass: TankClass }[],
   mode: MatchMode = 'coop',
+  mapId: MapId = 'classic',
 ): MatchConfig {
   const players: PlayerConfig[] = roster.map((p, i) => ({
     id: p.id,
@@ -16,7 +17,7 @@ export function createOnlineMatchConfig(
     isLocal: false,
     tankClass: p.tankClass,
   }));
-  return { session: 'online', mode, players, options: { startDifficulty: 1 } };
+  return { session: 'online', mode, players, mapId, options: { startDifficulty: 1 } };
 }
 
 /**
@@ -26,7 +27,7 @@ export function createOnlineMatchConfig(
 export function createMatchConfig(
   session: SessionKind,
   mode: MatchMode,
-  options?: { startDifficulty?: number; classes?: TankClass[] },
+  options?: { startDifficulty?: number; classes?: TankClass[]; mapId?: MapId },
 ): MatchConfig {
   const classes = options?.classes ?? [];
   const players: MatchConfig['players'] = [
@@ -56,6 +57,7 @@ export function createMatchConfig(
     session,
     mode,
     players,
+    mapId: options?.mapId ?? 'classic',
     options: { startDifficulty: options?.startDifficulty ?? 1 },
   };
 }

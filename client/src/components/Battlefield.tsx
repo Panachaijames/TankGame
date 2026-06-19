@@ -13,6 +13,7 @@ import {
   BOSS_SCORE_THRESHOLD,
   TANK_CLASSES,
   LASER_RANGE,
+  SHOTGUN,
   ULTIMATES,
   MAX_ENERGY,
   ENERGY_PER_KILL,
@@ -22,7 +23,7 @@ import {
 import {
   Tank, Bullet, Explosion, Particle, RepairItem,
   GameState, WeatherType, TerrainType, EnemyType,
-  type TankClass, type PlayerConfig
+  type TankClass, type PlayerConfig, type MapId
 } from '../types';
 import { audioService } from '../services/audioService';
 import { sampleLocalInputs, sampleLocalInput } from '../input/localInput';
@@ -83,6 +84,12 @@ interface SpecializedBullet extends Bullet {
   wobbleSpeed?: number;
   isPersistent?: boolean;
   ownerId?: string; // who fired it (versus: bullets skip their owner, damage others)
+  // Shotgun pellets: damage falls off with distance from the muzzle and the
+  // pellet despawns past `maxRange` (short, lethal-up-close scatter).
+  originX?: number;
+  originY?: number;
+  maxRange?: number;
+  falloffMin?: number;
 }
 
 /**
@@ -122,6 +129,15 @@ export interface Obstacle {
   kind: 'crate' | 'rock';
   health: number; // 0 for rocks (indestructible)
   maxHealth: number;
+}
+
+// Foliage bushes (forest map). Soft cover: doesn't block movement or bullets,
+// but a tank sitting still inside one is concealed from enemy AI (ambush).
+export interface Bush {
+  id: string;
+  x: number; // centre
+  y: number;
+  r: number; // canopy radius
 }
 
 // Ground hazards: artillery strike warnings (then splash) + Sapper proximity mines.
@@ -176,6 +192,7 @@ export interface WorldSnapshot {
   arena: { w: number; h: number };
   storm?: StormSnapshot;
   obstacles: Obstacle[];
+  bushes: Bush[];
   fireAlerts: FireAlert[];
   hazards: Hazard[];
 }
@@ -222,6 +239,7 @@ interface BattlefieldProps {
   net?: NetAdapter | null;
   directControls?: boolean;
   matchMode?: 'coop' | 'versus';
+  mapId?: MapId;
 }
 
 type PlayerEntity = Tank & {
@@ -234,7 +252,7 @@ type PlayerEntity = Tank & {
   damage: number;
   fireRate: number;
   bulletSpeed: number;
-  weapon: 'projectile' | 'laser';
+  weapon: 'projectile' | 'laser' | 'shotgun';
   regen: boolean;
   lastFireTime: number;
   regenAccumulator: number;
@@ -301,6 +319,49 @@ function makeObstacles(worldW: number, worldH: number, count: number): Obstacle[
     obs.push({ id: `o${obs.length}`, x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(h), kind: crate ? 'crate' : 'rock', health: hp, maxHealth: hp });
   }
   return obs;
+}
+
+/** Scatter foliage bushes across the world (forest map). Dense, slightly
+ *  clustered, kept off the immediate spawn points so nobody starts blind. */
+function makeBushes(worldW: number, worldH: number, count: number): Bush[] {
+  const big = worldW > CANVAS_WIDTH;
+  const spawns = big
+    ? BIG_SPAWN_FRACS.map((f) => ({ x: f[0] * worldW, y: f[1] * worldH }))
+    : [{ x: worldW / 2, y: worldH - 100 }];
+  const bushes: Bush[] = [];
+  let tries = 0;
+  while (bushes.length < count && tries < count * 20) {
+    tries++;
+    const x = 90 + Math.random() * (worldW - 180);
+    const y = 90 + Math.random() * (worldH - 180);
+    if (spawns.some((s) => Math.hypot(s.x - x, s.y - y) < 240)) continue;
+    const r = 42 + Math.random() * 46;
+    bushes.push({ id: `b${bushes.length}`, x: Math.round(x), y: Math.round(y), r: Math.round(r) });
+    // Often drop a companion clump nearby for thickets you can string together.
+    if (Math.random() < 0.5 && bushes.length < count) {
+      const a = Math.random() * Math.PI * 2;
+      const d = r * (0.8 + Math.random() * 0.6);
+      bushes.push({ id: `b${bushes.length}`, x: Math.round(x + Math.cos(a) * d), y: Math.round(y + Math.sin(a) * d), r: Math.round(r * 0.85) });
+    }
+  }
+  return bushes;
+}
+
+/** Distance-based damage multiplier for a shotgun pellet (1 at the muzzle →
+ *  `falloffMin` at `maxRange`). Plain bullets (no maxRange) are unaffected. */
+function pelletMult(b: SpecializedBullet): number {
+  if (b.maxRange == null || b.originX == null || b.originY == null) return 1;
+  const d = Math.hypot(b.x - b.originX, b.y - b.originY);
+  const t = Math.min(1, d / b.maxRange);
+  return 1 - t * (1 - (b.falloffMin ?? 0.25));
+}
+
+/** The bush whose canopy covers (x,y), if any (concealment test). */
+function bushAt(bushes: Bush[], x: number, y: number): Bush | null {
+  for (const b of bushes) {
+    if (Math.hypot(b.x - x, b.y - y) < b.r * 0.9) return b;
+  }
+  return null;
 }
 
 /** Push a tank (circle of radius r) out of an axis-aligned obstacle rect. */
@@ -430,7 +491,7 @@ function nearestPlayer(players: PlayerEntity[], e: { x: number; y: number }): Pl
   return best;
 }
 
-const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, difficulty, status, graphicsQuality, playerConfigs, online, isHost, localPlayerId, net, directControls, matchMode }) => {
+const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, difficulty, status, graphicsQuality, playerConfigs, online, isHost, localPlayerId, net, directControls, matchMode, mapId }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const gameEndedRef = useRef(false);
   const statusRef = useRef(status);
@@ -446,11 +507,13 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
   const versusRef = useRef(false);
   const clientHudSigRef = useRef('');
   const predictedSelfRef = useRef<{ x: number; y: number; angle: number; turretAngle: number; velocity: { x: number; y: number } } | null>(null);
-  // Online plays on the big battle-royale world with a follow camera; solo /
-  // local-2P keep the single-screen arena. Stable for the life of this match
-  // (the component is keyed by gameId, so it remounts per match).
-  const WORLD_W = online ? BIG_WORLD.w : CANVAS_WIDTH;
-  const WORLD_H = online ? BIG_WORLD.h : CANVAS_HEIGHT;
+  // Online (and the big solo FOREST map) play on the huge follow-camera world;
+  // classic solo / local-2P keep the single-screen arena. Stable for the life of
+  // this match (the component is keyed by gameId, so it remounts per match).
+  const forestMap = mapId === 'forest';
+  const bigWorld = !!online || forestMap;
+  const WORLD_W = bigWorld ? BIG_WORLD.w : CANVAS_WIDTH;
+  const WORLD_H = bigWorld ? BIG_WORLD.h : CANVAS_HEIGHT;
   // ION STORM — shrinking safe-zone, online versus only. Starts covering the
   // whole world, then closes in phases (grace → shrink), dealing escalating
   // out-of-zone damage so the huge map can't be camped.
@@ -460,7 +523,9 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
   const stateRef = useRef({
     worldW: WORLD_W,
     worldH: WORLD_H,
-    obstacles: makeObstacles(WORLD_W, WORLD_H, online ? 46 : 10),
+    forestMap,
+    obstacles: makeObstacles(WORLD_W, WORLD_H, online ? 46 : forestMap ? 30 : 10),
+    bushes: forestMap ? makeBushes(WORLD_W, WORLD_H, 90) : ([] as Bush[]),
     fireAlerts: [] as FireAlert[],
     hazards: [] as Hazard[],
     storm: {
@@ -526,7 +591,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     bomberCounter: 0,
     weatherTimer: 0,
     weather: WeatherType.Clear,
-    terrain: TerrainType.Grassland,
+    terrain: forestMap ? TerrainType.Forest : TerrainType.Grassland,
     treadMarks: [] as TreadMark[]
   });
 
@@ -665,6 +730,41 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
       if (pe.ammo <= 0) initiateReload(pe);
     }
   }, [initiateReload]);
+
+  // RANGER scattergun: one shell ejects a cone of pellets. Each pellet loses
+  // damage with distance and despawns past SHOTGUN.range — brutal point-blank,
+  // feeble far away (see pelletMult in the bullet loop).
+  const fireShotgun = useCallback((p: PlayerEntity) => {
+    const s = stateRef.current;
+    if (p.isCooldown || p.ammo <= 0) return;
+    const base = p.turretAngle;
+    const ox = p.x + Math.cos(base) * (p.width / 2 + 12);
+    const oy = p.y + Math.sin(base) * (p.width / 2 + 12);
+    for (let i = 0; i < SHOTGUN.pellets; i++) {
+      const frac = SHOTGUN.pellets > 1 ? i / (SHOTGUN.pellets - 1) - 0.5 : 0; // -0.5 … 0.5
+      const ang = base + frac * SHOTGUN.spread + (Math.random() - 0.5) * 0.06;
+      const spd = p.bulletSpeed * (0.85 + Math.random() * 0.3);
+      s.bullets.push({
+        id: Math.random().toString(36).substring(2, 10),
+        x: ox, y: oy,
+        width: 7, height: 12, angle: ang,
+        dx: Math.cos(ang) * spd, dy: Math.sin(ang) * spd,
+        damage: p.damage, color: p.color,
+        isHighPowered: false, isSuperBullet: false, isExplosive: false,
+        isAllied: true, ownerId: p.id, radius: 5, history: [], trailHistory: [],
+        originX: ox, originY: oy, maxRange: SHOTGUN.range, falloffMin: SHOTGUN.falloffMin,
+      });
+    }
+    p.recoilOffset = PHYSICS.RECOIL_FORCE * 11;
+    p.velocity.x -= Math.cos(base) * PHYSICS.RECOIL_FORCE * 1.7;
+    p.velocity.y -= Math.sin(base) * PHYSICS.RECOIL_FORCE * 1.7;
+    p.ammo--;
+    p.lastFireTime = Date.now();
+    audioService.playShoot(true);
+    createParticles(ox, oy, p.color, 8, 'spark');
+    s.screenShake = Math.max(s.screenShake, 11);
+    if (p.ammo <= 0) initiateReload(p);
+  }, [initiateReload, createParticles]);
 
   const fireAutoSwarm = useCallback((count: number, source?: PlayerEntity) => {
     const s = stateRef.current;
@@ -880,11 +980,22 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     if (!ENEMY_CONFIGS[type].isBoss && stateRef.current.enemies.length + stateRef.current.spawnIndicators.length >= MAX_ENEMIES) return;
     const s = stateRef.current;
     let x, y, angle;
-    const side = Math.floor(Math.random() * 4);
-    if (side === 0) { x = Math.random() * CANVAS_WIDTH; y = 15; angle = Math.PI/2; } 
-    else if (side === 1) { x = CANVAS_WIDTH - 15; y = Math.random() * CANVAS_HEIGHT; angle = Math.PI; } 
-    else if (side === 2) { x = Math.random() * CANVAS_WIDTH; y = CANVAS_HEIGHT - 15; angle = -Math.PI/2; } 
-    else { x = 15; y = Math.random() * CANVAS_HEIGHT; angle = 0; } 
+    if (s.worldW > CANVAS_WIDTH) {
+      // Big world (solo FOREST): spawn on a ring just off-screen around the player
+      // so enemies actually converge wherever you've roamed, not at a fixed corner.
+      const p = s.players.find((pl) => pl.health > 0) ?? s.players[0];
+      const a = Math.random() * Math.PI * 2;
+      const r = 640 + Math.random() * 240;
+      x = Math.max(50, Math.min(s.worldW - 50, p.x + Math.cos(a) * r));
+      y = Math.max(50, Math.min(s.worldH - 50, p.y + Math.sin(a) * r));
+      angle = Math.atan2(p.y - y, p.x - x);
+    } else {
+      const side = Math.floor(Math.random() * 4);
+      if (side === 0) { x = Math.random() * CANVAS_WIDTH; y = 15; angle = Math.PI/2; }
+      else if (side === 1) { x = CANVAS_WIDTH - 15; y = Math.random() * CANVAS_HEIGHT; angle = Math.PI; }
+      else if (side === 2) { x = Math.random() * CANVAS_WIDTH; y = CANVAS_HEIGHT - 15; angle = -Math.PI/2; }
+      else { x = 15; y = Math.random() * CANVAS_HEIGHT; angle = 0; }
+    }
 
     s.spawnIndicators.push({ x, y, angle, timer: 75, type });
   }, []);
@@ -893,11 +1004,20 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     const config = ENEMY_CONFIGS[type];
     let x = xPos, y = yPos;
     if (x === undefined || y === undefined) {
-      const side = Math.floor(Math.random() * 4);
-      if (side === 0) { x = Math.random() * CANVAS_WIDTH; y = -150; }
-      else if (side === 1) { x = CANVAS_WIDTH + 150; y = Math.random() * CANVAS_HEIGHT; }
-      else if (side === 2) { x = Math.random() * CANVAS_WIDTH; y = CANVAS_HEIGHT + 150; }
-      else { x = -150; y = Math.random() * CANVAS_HEIGHT; }
+      const st = stateRef.current;
+      if (st.worldW > CANVAS_WIDTH) {
+        const p = st.players.find((pl) => pl.health > 0) ?? st.players[0];
+        const a = Math.random() * Math.PI * 2;
+        const r = 700 + Math.random() * 260;
+        x = Math.max(50, Math.min(st.worldW - 50, p.x + Math.cos(a) * r));
+        y = Math.max(50, Math.min(st.worldH - 50, p.y + Math.sin(a) * r));
+      } else {
+        const side = Math.floor(Math.random() * 4);
+        if (side === 0) { x = Math.random() * CANVAS_WIDTH; y = -150; }
+        else if (side === 1) { x = CANVAS_WIDTH + 150; y = Math.random() * CANVAS_HEIGHT; }
+        else if (side === 2) { x = Math.random() * CANVAS_WIDTH; y = CANVAS_HEIGHT + 150; }
+        else { x = -150; y = Math.random() * CANVAS_HEIGHT; }
+      }
     }
 
     stateRef.current.enemies.push({
@@ -1243,6 +1363,8 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
           audioService.playShoot(true);
           s.screenShake = Math.max(s.screenShake, 16);
           if (p.ammo <= 0) initiateReload(p);
+        } else if (p.weapon === 'shotgun') {
+          fireShotgun(p);
         } else {
           fireBullet(p, true);
         }
@@ -1299,8 +1421,36 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
           p.ultSpin = 0;
           s.screenFlash = Math.max(s.screenFlash, 0.3);
           s.screenShake = Math.max(s.screenShake, 30);
+        } else if (p.tankClass === 'ranger') {
+          // FLECHETTE STORM: a 360° point-blank shotgun nova — a ring of falloff
+          // pellets plus a knockback shockwave. Devastating if enemies crowd in.
+          const N = 48;
+          for (let i = 0; i < N; i++) {
+            const a = (i / N) * Math.PI * 2 + (Math.random() - 0.5) * 0.12;
+            const spd = 13 + Math.random() * 7;
+            s.bullets.push({
+              id: Math.random().toString(36).substring(2, 10),
+              x: p.x + Math.cos(a) * (p.width / 2), y: p.y + Math.sin(a) * (p.width / 2),
+              width: 8, height: 14, angle: a,
+              dx: Math.cos(a) * spd, dy: Math.sin(a) * spd,
+              damage: 46, color: accent,
+              isHighPowered: false, isSuperBullet: false, isExplosive: false,
+              isAllied: true, ownerId: p.id, radius: 6, history: [], trailHistory: [],
+              originX: p.x, originY: p.y, maxRange: 560, falloffMin: 0.3,
+            });
+          }
+          s.explosions.push({ x: p.x, y: p.y, radius: 10, maxRadius: 280, opacity: 1, fadeSpeed: 0.03, color: accent });
+          s.enemies.forEach((e) => {
+            if (Math.hypot(e.x - p.x, e.y - p.y) < 220) { e.health -= 90; if (e.health <= 0) onEnemyKill(e); }
+          });
+          damagePlayersRadius(p.x, p.y, 220, 90, p.id); // versus: nova mauls nearby tanks
+          s.screenFlash = Math.max(s.screenFlash, 0.5);
+          s.screenShake = Math.max(s.screenShake, 55);
         } else {
-          // ORBITAL LANCE (railgun): colossal screen-piercing beam.
+          // ORBITAL LANCE (railgun): a focused, screen-piercing beam. Narrowest
+          // ult in the game, so it hits the HARDEST per target — a precision nuke,
+          // unlike the wide AoE ults (assault/ranger nova, vanguard spin).
+          const LANCE_DMG = 650;
           const dirx = Math.cos(p.turretAngle);
           const diry = Math.sin(p.turretAngle);
           s.enemies.forEach((e) => {
@@ -1310,13 +1460,13 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
             if (t < 0 || t > LASER_RANGE) return;
             const perp = Math.abs(relx * diry - rely * dirx);
             if (perp < e.width / 2 + 45) {
-              e.health -= 400;
+              e.health -= LANCE_DMG;
               createParticles(p.x + dirx * t, p.y + diry * t, '#ffffff', 18, 'spark');
               if (e.health <= 0) onEnemyKill(e);
             }
           });
-          damagePlayersRay(p.x, p.y, dirx, diry, LASER_RANGE, 45, 400, p.id); // versus: lance vaporises tanks
-          damageCratesAlongRay(p.x, p.y, dirx, diry, LASER_RANGE, 400); // shatter crates in the lance's path
+          damagePlayersRay(p.x, p.y, dirx, diry, LASER_RANGE, 45, LANCE_DMG, p.id); // versus: lance vaporises tanks
+          damageCratesAlongRay(p.x, p.y, dirx, diry, LASER_RANGE, LANCE_DMG); // shatter crates in the lance's path
           s.beams.push({ x1: p.x, y1: p.y, x2: p.x + dirx * LASER_RANGE, y2: p.y + diry * LASER_RANGE, color: '#ffffff', life: 22, maxLife: 22, width: 42 });
           s.screenFlash = Math.max(s.screenFlash, 1.0);
           s.screenShake = Math.max(s.screenShake, 120);
@@ -1326,6 +1476,20 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
       p.ultReady = p.energy >= p.maxEnergy;
 
       p.recoilOffset *= 0.75;
+
+      // Bush concealment (forest map): hold still and hold fire inside foliage to
+      // drop off the AI's radar — break cover (move fast or shoot) and you're seen.
+      if (s.bushes.length) {
+        const moving = Math.hypot(p.velocity.x, p.velocity.y) > 1.7;
+        const justFired = Date.now() - p.lastFireTime < 450;
+        const hidden = !!bushAt(s.bushes, p.x, p.y) && !moving && !justFired;
+        if (hidden && !p.concealed) {
+          s.floatingTexts.push({ x: p.x, y: p.y - 52, text: '● HIDDEN', opacity: 1, lifespan: 64, color: '#34d399', size: 15 });
+        }
+        p.concealed = hidden;
+      } else {
+        p.concealed = false;
+      }
     }
 
     if (s.score - s.lastBossScore >= BOSS_SCORE_THRESHOLD) {
@@ -1401,13 +1565,25 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
       const cfg = ENEMY_CONFIGS[e.enemyType!];
       const arch = cfg.archetype;
       const boss = cfg.isBoss;
-      const target = nearestPlayer(s.players, e);
+      // Pick the nearest player this enemy can actually SEE. A player concealed in
+      // a bush is invisible beyond a short reveal radius (bosses aren't fooled).
+      const REVEAL_DIST = 165;
+      let target = s.players[0];
+      let bd = Infinity;
+      let sawVisible = false;
+      for (const p of s.players) {
+        if (p.health <= 0) continue;
+        const d = Math.hypot(p.x - e.x, p.y - e.y);
+        const visible = boss || !p.concealed || d < REVEAL_DIST;
+        if (visible && d < bd) { bd = d; target = p; sawVisible = true; }
+      }
+      if (!sawVisible) target = nearestPlayer(s.players, e); // a point to idle-face
       const dist = Math.hypot(target.x - e.x, target.y - e.y);
       const angle = Math.atan2(target.y - e.y, target.x - e.x);
 
-      // Weather is purely atmospheric now — it no longer blinds enemies (that
-      // froze them idling at the map edges whenever fog/snow rolled in).
-      const detectsPlayer = true;
+      // Weather is purely atmospheric (it no longer blinds enemies). Detection is
+      // gated only by bush concealment now: no visible target ⇒ the enemy idles.
+      const detectsPlayer = sawVisible;
 
       e.aiTimer = (e.aiTimer ?? 0) + delta;
       e.shootTimer += delta;
@@ -1678,7 +1854,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
         if (Math.abs(b.x - o.x) < o.w / 2 + b.radius && Math.abs(b.y - o.y) < o.h / 2 + b.radius) {
           bToRemove.add(b.id);
           if (o.kind === 'crate') {
-            o.health -= b.damage;
+            o.health -= b.damage * pelletMult(b);
             createParticles(b.x, b.y, '#fbbf24', 8, 'spark');
             if (o.health <= 0) destroyCrate(o);
           } else {
@@ -1695,7 +1871,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
           for (const p of s.players) {
             if (p.health <= 0 || p.id === b.ownerId) continue;
             if (Math.hypot(b.x - p.x, b.y - p.y) < p.width / 2 + b.radius) {
-              p.health -= b.damage; bToRemove.add(b.id);
+              p.health -= b.damage * pelletMult(b); bToRemove.add(b.id);
               audioService.playHit();
               createParticles(b.x, b.y, p.color, 14, 'spark');
               if (b.isExplosive) {
@@ -1722,7 +1898,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
                 return;
               }
             }
-            e.health -= b.damage; bToRemove.add(b.id);
+            e.health -= b.damage * pelletMult(b); bToRemove.add(b.id);
             createParticles(b.x, b.y, e.color, 15, 'spark');
             if (e.health <= 0) onEnemyKill(e);
             if (b.isExplosive) {
@@ -1747,6 +1923,9 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     s.bullets = s.bullets.filter(b => {
         if (bToRemove.has(b.id)) return false;
         if (b.isPersistent) return true;
+        // Shotgun pellets have a hard short range — drop them once spent.
+        if (b.maxRange != null && b.originX != null && b.originY != null &&
+            Math.hypot(b.x - b.originX, b.y - b.originY) > b.maxRange) return false;
         return b.x > -300 && b.x < s.worldW + 300 && b.y > -300 && b.y < s.worldH + 300;
     });
     
@@ -1825,20 +2004,27 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
         : 30000;
     if (!onlineRef.current && s.weatherTimer > weatherSpell) {
       s.weatherTimer = 0;
-      
-      const weathers = Object.values(WeatherType);
-      const terrains = Object.values(TerrainType);
-      
+
+      // The FOREST map is a fixed biome — terrain stays Forest and only mild
+      // weather (clear/rain/fog) rolls through. Classic maps cycle all biomes,
+      // but Forest is a dedicated map, never a random weather biome.
+      const weathers = s.forestMap
+        ? [WeatherType.Clear, WeatherType.Rain, WeatherType.Fog]
+        : Object.values(WeatherType);
+      const terrains = Object.values(TerrainType).filter((t) => t !== TerrainType.Forest);
+
       let nextWeather = weathers[Math.floor(Math.random() * weathers.length)];
-      let nextTerrain = terrains[Math.floor(Math.random() * terrains.length)];
-      
+      let nextTerrain = s.forestMap
+        ? TerrainType.Forest
+        : terrains[Math.floor(Math.random() * terrains.length)];
+
       // Keep extreme weather terrains visually and physically consistent
-      if (nextWeather === WeatherType.Snowstorm) {
+      if (!s.forestMap && nextWeather === WeatherType.Snowstorm) {
         nextTerrain = TerrainType.Snow;
-      } else if (nextWeather === WeatherType.Sandstorm) {
+      } else if (!s.forestMap && nextWeather === WeatherType.Sandstorm) {
         nextTerrain = TerrainType.Desert;
       }
-      
+
       s.weather = nextWeather;
       s.terrain = nextTerrain;
       
@@ -2020,7 +2206,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
         ultName: ULTIMATES[p0.tankClass].label,
       });
     }
-  }, [onStateUpdate, status, onGameOver, spawnSpecificEnemy, fireBullet, onEnemyKill, initiateReload, createParticles, fireAutoSwarm, requestSpawn, resolveTankCollisions, checkGameOver, damagePlayersRadius, damagePlayersRay, updateStorm, resolveObstacles, destroyCrate, damageCratesAlongRay]);
+  }, [onStateUpdate, status, onGameOver, spawnSpecificEnemy, fireBullet, fireShotgun, onEnemyKill, initiateReload, createParticles, fireAutoSwarm, requestSpawn, resolveTankCollisions, checkGameOver, damagePlayersRadius, damagePlayersRay, updateStorm, resolveObstacles, destroyCrate, damageCratesAlongRay]);
 
   const drawTank = (ctx: CanvasRenderingContext2D, t: Tank) => {
     ctx.save(); ctx.translate(t.x, t.y);
@@ -2303,6 +2489,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
       bomberReady: cs.bomberCounter >= BOMBER_TARGET,
       arena: { w: cs.worldW, h: cs.worldH },
       obstacles: cs.obstacles,
+      bushes: cs.bushes,
       fireAlerts: cs.fireAlerts,
       hazards: cs.hazards,
       storm: {
@@ -2348,6 +2535,9 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     } else if (s.terrain === TerrainType.Snow) {
       groundColor = '#111827'; // cold deep arctic navy
       gridColor = 'rgba(186, 230, 253, 0.06)';
+    } else if (s.terrain === TerrainType.Forest) {
+      groundColor = '#0d1f12'; // deep lush forest floor
+      gridColor = 'rgba(52, 211, 153, 0.06)';
     }
 
     ctx.fillStyle = groundColor;

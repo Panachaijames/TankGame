@@ -13,7 +13,12 @@ export interface Entity {
   angle: number; // Chassis angle
 }
 
-export type TankClass = 'assault' | 'vanguard' | 'sniper';
+export type TankClass = 'assault' | 'vanguard' | 'sniper' | 'ranger';
+
+// Selectable battlefields. `classic` is the original arena (small solo / big BR
+// world online); `forest` is a huge follow-camera forest map dense with bushes
+// the close-range RANGER class can hide in to ambush.
+export type MapId = 'classic' | 'forest';
 
 export interface Tank extends Entity {
   turretAngle: number;
@@ -39,6 +44,7 @@ export interface Tank extends Entity {
   // Player-only weapon/loadout fields (used by the renderer for the ammo bar,
   // barrel shape and class accent). Undefined on enemies.
   tankClass?: TankClass;
+  concealed?: boolean; // hidden inside foliage — AI loses track (forest map)
   ammo?: number;
   maxAmmo?: number;
   reloading?: boolean;
@@ -149,7 +155,8 @@ export enum WeatherType {
 export enum TerrainType {
   Grassland = 'Grassland',
   Desert = 'Desert',
-  Snow = 'Snow'
+  Snow = 'Snow',
+  Forest = 'Forest'
 }
 
 export interface GameState {
@@ -214,6 +221,7 @@ export interface MatchConfig {
   mode: MatchMode;
   players: PlayerConfig[];
   roomCode?: string;
+  mapId?: MapId; // chosen battlefield (defaults to 'classic')
   options: MatchOptions;
 }
 

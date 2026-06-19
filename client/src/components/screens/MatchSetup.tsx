@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { useShell } from '../../state/AppShellContext';
-import type { MatchConfig, MatchMode, TankClass } from '../../types';
-import { TANK_CLASSES } from '../../constants';
+import type { MatchConfig, MatchMode, TankClass, MapId } from '../../types';
+import { TANK_CLASSES, SHOTGUN } from '../../constants';
 import Button from '../ui/Button';
 import Panel from '../ui/Panel';
 
@@ -15,6 +15,11 @@ const DIFFICULTIES = [
   { value: 5, label: 'ELITE', desc: 'Brutal from the start' },
 ];
 
+const MAPS: { id: MapId; label: string; desc: string; icon: string }[] = [
+  { id: 'classic', label: 'ARENA', desc: 'Classic single-screen battlefield. Rotating biomes & weather.', icon: '🎯' },
+  { id: 'forest', label: 'FOREST', desc: 'Huge forest world. Dense bushes to hide in — ambush ground for the shotgun.', icon: '🌲' },
+];
+
 const CLASS_LIST = Object.keys(TANK_CLASSES) as TankClass[];
 
 export const MatchSetup: React.FC<MatchSetupProps> = ({ onLaunch }) => {
@@ -26,10 +31,15 @@ export const MatchSetup: React.FC<MatchSetupProps> = ({ onLaunch }) => {
   const [classes, setClasses] = useState<TankClass[]>(
     () => base?.players.map((p) => p.tankClass) ?? ['assault'],
   );
+  const [map, setMap] = useState<MapId>(base?.mapId ?? 'classic');
 
   if (!base) return null;
 
   const isMultiplayer = base.session !== 'solo';
+  // The big follow-camera forest can only track one tank, so it's solo-only
+  // (local-2P shares a single screen with two pilots).
+  const forestAllowed = base.session === 'solo';
+  const effectiveMap: MapId = forestAllowed ? map : 'classic';
 
   const pickClass = (slot: number, c: TankClass) =>
     setClasses((prev) => prev.map((x, i) => (i === slot ? c : x)));
@@ -38,6 +48,7 @@ export const MatchSetup: React.FC<MatchSetupProps> = ({ onLaunch }) => {
     const config: MatchConfig = {
       ...base,
       mode,
+      mapId: effectiveMap,
       players: base.players.map((p, i) => ({ ...p, tankClass: classes[i] ?? p.tankClass })),
       options: { ...base.options, startDifficulty: difficulty },
     };
@@ -66,10 +77,11 @@ export const MatchSetup: React.FC<MatchSetupProps> = ({ onLaunch }) => {
                     {p.name}
                   </div>
                 )}
-                <div className="grid grid-cols-3 gap-2">
+                <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
                   {CLASS_LIST.map((c) => {
                     const cls = TANK_CLASSES[c];
                     const selected = classes[slot] === c;
+                    const dmgLabel = cls.weapon === 'shotgun' ? `${cls.damage}×${SHOTGUN.pellets}` : `${cls.damage}`;
                     return (
                       <button
                         key={c}
@@ -85,7 +97,7 @@ export const MatchSetup: React.FC<MatchSetupProps> = ({ onLaunch }) => {
                         </div>
                         <div className="mt-1 mb-2 text-[10px] leading-tight text-slate-400">{cls.desc}</div>
                         <div className="grid grid-cols-2 gap-x-2 gap-y-0.5 font-orbitron text-[10px] text-slate-300">
-                          <span>DMG {cls.damage}</span>
+                          <span>DMG {dmgLabel}</span>
                           <span>RoF {(1000 / cls.fireRate).toFixed(1)}/s</span>
                           <span>MAG {cls.maxAmmo}</span>
                           <span>HP {cls.health}</span>
@@ -96,6 +108,39 @@ export const MatchSetup: React.FC<MatchSetupProps> = ({ onLaunch }) => {
                 </div>
               </div>
             ))}
+          </div>
+        </div>
+
+        {/* Battlefield / map picker */}
+        <div className="mb-8">
+          <div className="mb-3 font-orbitron text-sm uppercase tracking-widest text-slate-400">
+            Battlefield
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            {MAPS.map((m) => {
+              const disabled = m.id === 'forest' && !forestAllowed;
+              const selected = effectiveMap === m.id;
+              return (
+                <button
+                  key={m.id}
+                  disabled={disabled}
+                  onClick={() => !disabled && setMap(m.id)}
+                  className={`rounded-xl border p-3 text-left transition ${
+                    disabled
+                      ? 'cursor-not-allowed border-slate-800 bg-slate-900/30 opacity-50'
+                      : selected
+                        ? 'border-sky-500 bg-sky-500/10 shadow-[0_0_18px_rgba(56,189,248,0.2)]'
+                        : 'border-slate-700 bg-slate-800/40 hover:border-slate-500'
+                  }`}
+                >
+                  <div className="font-orbitron text-sm font-bold text-white">
+                    {m.icon} {m.label}
+                    {disabled ? ' · SOLO ONLY' : ''}
+                  </div>
+                  <div className="mt-1 text-[10px] leading-tight text-slate-400">{m.desc}</div>
+                </button>
+              );
+            })}
           </div>
         </div>
 

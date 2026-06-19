@@ -81,15 +81,39 @@ export const TANK_CLASSES = {
     barrelW: 0.09,
     regen: false,
   },
+  ranger: {
+    id: 'ranger',
+    label: 'SHOTGUN',
+    desc: 'Close-range scattergun. Point-blank blast out-damages the railgun, but fades fast at range. Ambush from the bushes.',
+    accent: '#f59e0b',
+    width: 50,
+    height: 40,
+    health: 95,
+    maxAmmo: 8, // shells
+    damage: 22, // PER PELLET — see SHOTGUN.pellets (8 × 22 = 176 point-blank)
+    fireRate: 600, // slow pump
+    reload: 1900,
+    bulletSpeed: 15,
+    weapon: 'shotgun',
+    barrelLen: 0.5,
+    barrelW: 0.34, // fat double barrel
+    regen: true,
+  },
 } as const;
 
 export const LASER_RANGE = 1400;
+
+// Scattergun pellet spread for the RANGER class. Pellets fan out in a cone and
+// lose damage with distance (full at the muzzle, `falloffMin` of it at `range`),
+// then despawn past `range` — devastating up close, near-useless far away.
+export const SHOTGUN = { pellets: 8, spread: 0.46, range: 380, falloffMin: 0.2 } as const;
 
 // Per-class ultimate names (behaviour is implemented per class id in the sim).
 export const ULTIMATES = {
   assault: { label: 'VALKYRIE BARRAGE' },
   vanguard: { label: 'MAELSTROM' },
   sniper: { label: 'ORBITAL LANCE' },
+  ranger: { label: 'FLECHETTE STORM' },
 } as const;
 
 // Energy economy: fills the ultimate gauge. Earned from kills + energy cells

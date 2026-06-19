@@ -135,7 +135,7 @@ const GameRoot: React.FC = () => {
     // (the offline launch() path would drop the connection + run a broken solo).
     if (online.active) {
       if (online.isHost) {
-        netStartMatch(createOnlineMatchConfig(net.players, shell.match?.mode ?? 'versus'));
+        netStartMatch(createOnlineMatchConfig(net.players, shell.match?.mode ?? 'versus', shell.match?.mapId ?? 'classic'));
       }
       // Non-host clients can't force a rematch; they wait for the host (PLAY AGAIN hidden).
       return;
@@ -195,6 +195,7 @@ const GameRoot: React.FC = () => {
             net={netAdapter}
             directControls={settings.movementMode === 'direct'}
             matchMode={shell.match?.mode ?? 'coop'}
+            mapId={shell.match?.mapId ?? 'classic'}
           />
           <HUD state={gameState} versus={shell.match?.mode === 'versus'} />
           <TopMenuBar config={shell.match} onPause={togglePause} />

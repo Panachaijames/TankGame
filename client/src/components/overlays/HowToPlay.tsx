@@ -69,6 +69,11 @@ export const HowToPlay: React.FC<HowToPlayProps> = ({ onClose }) => {
             sandstorm and snow change traction and enemy vision.
           </li>
           <li>
+            <span className="font-bold text-emerald-400">FOREST &amp; BUSHES:</span> on the Forest map,
+            sit still and hold fire inside a bush to vanish from enemies — perfect for the SHOTGUN
+            class to ambush. Moving fast or firing breaks cover.
+          </li>
+          <li>
             <span className="font-bold text-purple-400">BOSSES:</span> heavy units arrive as your
             score climbs — they unleash radial barrages.
           </li>

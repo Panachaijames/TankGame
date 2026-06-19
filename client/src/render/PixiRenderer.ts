@@ -29,6 +29,7 @@ const TERRAIN = {
   [TerrainType.Grassland]: { ground: 0x15241b, grid: 0x22c55e, accent: 0x22c55e },
   [TerrainType.Desert]: { ground: 0x211812, grid: 0xf59e0b, accent: 0xf59e0b },
   [TerrainType.Snow]: { ground: 0x111827, grid: 0xbae6fd, accent: 0xbae6fd },
+  [TerrainType.Forest]: { ground: 0x0d1f12, grid: 0x34d399, accent: 0x22c55e },
 } as const;
 
 // Weather shroud: tint, vision radius, opacity. Kept soft/atmospheric — a heavy
@@ -71,6 +72,7 @@ export class PixiRenderer {
   private beamGfx!: Graphics;
   private explosions!: Graphics;
   private particles!: Graphics;
+  private foliage!: Graphics; // bush canopies (world space, ABOVE tanks — conceal)
   private stormGfx!: Graphics; // ION STORM ring (world space, above fx, no bloom)
   private fireAlertGfx!: Graphics; // gunshot pings, on-screen (world space)
   private overlay!: Container; // not shaken
@@ -147,6 +149,11 @@ export class PixiRenderer {
     this.particles = new Graphics();
     this.fx.addChild(this.explosions, this.tankLayer, this.bullets, this.beamGfx, this.particles);
     this.world.addChild(this.fx);
+
+    // Bush canopies sit ABOVE the tanks/bullets so a tank inside one is visually
+    // concealed (world space, scrolls with the camera, kept out of the bloom).
+    this.foliage = new Graphics();
+    this.world.addChild(this.foliage);
 
     // ION STORM ring sits above the bloomed fx, in world space (scrolls w/ camera).
     this.stormGfx = new Graphics();
@@ -263,6 +270,7 @@ export class PixiRenderer {
     this.drawBeams(snap);
     this.drawExplosions(snap);
     this.drawParticles(snap);
+    this.drawFoliage(snap);
     this.drawWeather(snap);
     this.drawStorm(snap);
     this.drawFireAlerts(snap);
@@ -360,6 +368,37 @@ export class PixiRenderer {
         g.roundRect(x, y, o.w, o.h, 8).fill({ color: 0x39414f, alpha: 0.96 }).stroke({ width: 2, color: 0x64748b, alpha: 0.8 });
         g.circle(o.x - o.w * 0.16, o.y - o.h * 0.14, Math.min(o.w, o.h) * 0.17).fill({ color: 0x4b5563, alpha: 0.55 });
       }
+    }
+  }
+
+  /** Bush canopies (forest map). Drawn over the tanks so anyone sitting inside is
+   *  hidden; semi-transparent so you can still faintly track your own tank. Blob
+   *  offsets are derived from each bush's position so they don't shimmer. */
+  private drawFoliage(snap: WorldSnapshot) {
+    const g = this.foliage;
+    g.clear();
+    const bushes = snap.bushes;
+    if (!bushes || !bushes.length) return;
+    // Cull to the visible viewport (+margin) — the world holds ~90 bushes.
+    const minX = this.camX - 120, maxX = this.camX + VIEW_W + 120;
+    const minY = this.camY - 120, maxY = this.camY + VIEW_H + 120;
+    for (const b of bushes) {
+      if (b.x + b.r < minX || b.x - b.r > maxX || b.y + b.r < minY || b.y - b.r > maxY) continue;
+      // Soft ground shadow.
+      g.ellipse(b.x, b.y + b.r * 0.22, b.r * 0.95, b.r * 0.6).fill({ color: 0x06140b, alpha: 0.45 });
+      // Leafy clumps — deterministic ring of blobs.
+      const blobs = 5;
+      const seed = (b.x * 0.7 + b.y * 1.3) % (Math.PI * 2);
+      for (let i = 0; i < blobs; i++) {
+        const a = (i / blobs) * Math.PI * 2 + seed;
+        const ox = Math.cos(a) * b.r * 0.46;
+        const oy = Math.sin(a) * b.r * 0.4;
+        const dark = i % 2 === 0;
+        g.circle(b.x + ox, b.y + oy, b.r * 0.56).fill({ color: dark ? 0x18602f : 0x247d3f, alpha: 0.82 });
+      }
+      g.circle(b.x, b.y, b.r * 0.66).fill({ color: 0x2f9b4f, alpha: 0.8 });
+      // Top-left sheen.
+      g.circle(b.x - b.r * 0.22, b.y - b.r * 0.24, b.r * 0.24).fill({ color: 0x6fd98a, alpha: 0.45 });
     }
   }
 
@@ -486,6 +525,18 @@ export class PixiRenderer {
       g.poly([-w / 2 + 5, -h / 2 + 5, w / 2 - 2, -h / 2 + 9, w / 2 + 9, 0, w / 2 - 2, h / 2 - 9, -w / 2 + 5, h / 2 - 5])
         .fill(fill)
         .stroke({ width: 2.5, color: stroke, alpha: 0.95 });
+    } else if (cls === 'ranger') {
+      // Stocky ambush hull: rugged tracks, a wide armoured nose and a roll-cage.
+      g.roundRect(-w / 2 - 3, -h / 2 - 4, w + 6, 10, 3).fill(0x0b1220);
+      g.roundRect(-w / 2 - 3, h / 2 - 6, w + 6, 10, 3).fill(0x0b1220);
+      g.roundRect(-w / 2 + 2, -h / 2 + 2, w - 4, h - 4, 7).fill(fill).stroke({ width: 3, color: stroke, alpha: 0.95 });
+      // Wide blunt prow.
+      g.poly([w / 2 - 10, -h / 2 + 4, w / 2 + 7, -h * 0.22, w / 2 + 7, h * 0.22, w / 2 - 10, h / 2 - 4])
+        .fill(fill).stroke({ width: 2.5, color: stroke, alpha: 0.9 });
+      // Camo dapples (forest ambusher).
+      for (const [dx, dy, dr] of [[-w * 0.18, -h * 0.16, w * 0.1], [w * 0.06, h * 0.18, w * 0.08], [-w * 0.02, -h * 0.02, w * 0.07]] as const) {
+        g.circle(dx, dy, dr).fill({ color: 0x0f3d22, alpha: 0.5 });
+      }
     } else {
       // Assault (and AI enemies): sleek beveled battle tank with a pointed prow.
       g.roundRect(-w / 2, -h / 2 - 3, w, 7, 3).fill(0x0b1220);
@@ -608,6 +659,16 @@ export class PixiRenderer {
       }
       g.roundRect(bl - 6, -bw / 2, 6, bw, 1).fill(0xffffff);
       g.circle(0, 0, w * 0.26).fill(0x0f172a).stroke({ width: 2.5, color: stroke, alpha: 0.95 });
+    } else if (cls === 'ranger') {
+      // Short, fat side-by-side double barrels — a scattergun muzzle.
+      const bl = w * 0.5;
+      const bw = Math.max(5, w * 0.15);
+      for (const oy of [-w * 0.12, w * 0.12]) {
+        g.roundRect(0, oy - bw / 2, bl, bw, 2).fill(0x1e293b).stroke({ width: 1.5, color: stroke, alpha: 0.8 });
+        g.roundRect(bl - 5, oy - bw / 2, 5, bw, 1).fill(accent); // wide muzzle
+        g.circle(bl - 1, oy, bw * 0.32).fill(0x05070d); // bore
+      }
+      g.roundRect(-w * 0.28, -w * 0.26, w * 0.56, w * 0.52, 5).fill(0x0f172a).stroke({ width: 2.5, color: stroke, alpha: 0.95 });
     } else {
       // Assault (and AI enemies): single barrel + offset gun-sight.
       const arch = t.type === 'enemy' ? ecfg(t)?.archetype : null;

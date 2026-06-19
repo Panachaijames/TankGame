@@ -33,6 +33,7 @@ function stripTank(t: any) {
     maxEnergy: t.maxEnergy,
     isShielded: t.isShielded,
     recoilOffset: r2(t.recoilOffset),
+    concealed: t.concealed,
   };
 }
 
@@ -76,6 +77,7 @@ export function serializeSnapshot(s: WorldSnapshot): unknown {
     bomberReady: s.bomberReady,
     arena: s.arena,
     obstacles: s.obstacles.map((o) => ({ id: o.id, x: o.x, y: o.y, w: o.w, h: o.h, kind: o.kind, health: r(o.health), maxHealth: o.maxHealth })),
+    bushes: s.bushes.map((b) => ({ id: b.id, x: b.x, y: b.y, r: b.r })),
     fireAlerts: s.fireAlerts.map((a) => ({ x: r(a.x), y: r(a.y), ownerId: a.ownerId, life: a.life, maxLife: a.maxLife })),
     hazards: s.hazards,
     storm: s.storm
@@ -124,6 +126,7 @@ export function deserializeSnapshot(data: any, localId: string): WorldSnapshot {
     bomberReady: !!data.bomberReady,
     arena: data.arena || { w: 1000, h: 700 },
     obstacles: data.obstacles || [],
+    bushes: data.bushes || [],
     fireAlerts: data.fireAlerts || [],
     hazards: data.hazards || [],
     storm: data.storm,

@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { useShell } from '../../state/AppShellContext';
 import { useNet, MAX_PLAYERS } from '../../state/NetContext';
 import { createOnlineMatchConfig } from '../../state/matchConfig';
-import type { TankClass, MatchMode } from '../../types';
+import type { TankClass, MatchMode, MapId } from '../../types';
 import { TANK_CLASSES } from '../../constants';
 import Button from '../ui/Button';
 import Panel from '../ui/Panel';
@@ -24,6 +24,7 @@ export const Lobby: React.FC = () => {
   const [code, setCode] = useState('');
   const [cls, setCls] = useState<TankClass>('assault');
   const [mode, setMode] = useState<MatchMode>('versus'); // battle-royale by default
+  const [map, setMap] = useState<MapId>('classic'); // host picks the battlefield
 
   const persistName = (n: string) => {
     setName(n);
@@ -41,7 +42,7 @@ export const Lobby: React.FC = () => {
   };
 
   const ClassRow: React.FC<{ value: TankClass; onPick: (c: TankClass) => void }> = ({ value, onPick }) => (
-    <div className="grid grid-cols-3 gap-2">
+    <div className="grid grid-cols-2 gap-2">
       {CLASS_LIST.map((c) => {
         const tc = TANK_CLASSES[c];
         const sel = value === c;
@@ -209,9 +210,33 @@ export const Lobby: React.FC = () => {
             </div>
           </div>
         )}
+        {isHost && (
+          <div className="mt-5">
+            <span className="mb-1 block text-xs uppercase tracking-widest text-slate-400">Battlefield</span>
+            <div className="grid grid-cols-2 gap-2">
+              {(
+                [
+                  ['classic', '🎯 ARENA', 'Open battlefield'],
+                  ['forest', '🌲 FOREST', 'Bushes to ambush from'],
+                ] as const
+              ).map(([m, label, desc]) => (
+                <button
+                  key={m}
+                  onClick={() => setMap(m as MapId)}
+                  className={`rounded-lg border p-2 text-left transition ${
+                    map === m ? 'border-sky-500 bg-sky-500/10' : 'border-slate-700 bg-slate-800/40 hover:border-slate-500'
+                  }`}
+                >
+                  <div className="font-orbitron text-xs font-bold text-white">{label}</div>
+                  <div className="text-[10px] leading-tight text-slate-400">{desc}</div>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
         {!isHost && (
           <p className="mt-4 text-center text-[11px] uppercase tracking-widest text-slate-500">
-            Host picks the mode
+            Host picks the mode &amp; map
           </p>
         )}
       </Panel>
@@ -221,7 +246,7 @@ export const Lobby: React.FC = () => {
           ← LEAVE
         </Button>
         {isHost ? (
-          <Button size="lg" onClick={() => startMatch(createOnlineMatchConfig(net.players, mode))}>
+          <Button size="lg" onClick={() => startMatch(createOnlineMatchConfig(net.players, mode, map))}>
             START ▸
           </Button>
         ) : (
