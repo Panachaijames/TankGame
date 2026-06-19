@@ -854,6 +854,25 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     audioService.playHit();
   }, [createParticles]);
 
+  // Railgun laser/beam pierces cover but still damages destructible crates it
+  // passes through (so the railgun can break boxes for energy). Rocks are ignored.
+  const damageCratesAlongRay = useCallback((ox: number, oy: number, dirx: number, diry: number, range: number, dmg: number) => {
+    const s = stateRef.current;
+    for (const o of s.obstacles) {
+      if (o.kind !== 'crate') continue;
+      const relx = o.x - ox;
+      const rely = o.y - oy;
+      const t = relx * dirx + rely * diry;
+      if (t < 0 || t > range) continue;
+      const perp = Math.abs(relx * diry - rely * dirx);
+      if (perp < Math.max(o.w, o.h) / 2 + 6) {
+        o.health -= dmg;
+        createParticles(o.x, o.y, '#fbbf24', 8, 'spark');
+        if (o.health <= 0) destroyCrate(o);
+      }
+    }
+  }, [createParticles, destroyCrate]);
+
   const requestSpawn = useCallback((type: EnemyType) => {
     // Online is pure battle-royale PvP for now — no AI waves. (Solo / local keep them.)
     if (onlineRef.current) return;
@@ -1206,6 +1225,8 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
           });
           // Versus: the railgun beam pierces other players too.
           damagePlayersRay(ox, oy, dirx, diry, LASER_RANGE, 8, p.damage, p.id);
+          // Break destructible crates along the beam (for energy).
+          damageCratesAlongRay(ox, oy, dirx, diry, LASER_RANGE, p.damage);
           s.beams.push({
             x1: ox,
             y1: oy,
@@ -1295,6 +1316,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
             }
           });
           damagePlayersRay(p.x, p.y, dirx, diry, LASER_RANGE, 45, 400, p.id); // versus: lance vaporises tanks
+          damageCratesAlongRay(p.x, p.y, dirx, diry, LASER_RANGE, 400); // shatter crates in the lance's path
           s.beams.push({ x1: p.x, y1: p.y, x2: p.x + dirx * LASER_RANGE, y2: p.y + diry * LASER_RANGE, color: '#ffffff', life: 22, maxLife: 22, width: 42 });
           s.screenFlash = Math.max(s.screenFlash, 1.0);
           s.screenShake = Math.max(s.screenShake, 120);
@@ -1793,11 +1815,15 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
       if (s.bomber.x > CANVAS_WIDTH + 1000) s.bomber.active = false;
     }
 
-    // Climate & Environmental Shifts (every 30s). Skipped online — the big
-    // battle-royale map uses the ION STORM as its environmental mechanic, and the
-    // heavy weather vision-shroud reads as an ugly grey box on the scrolled world.
+    // Climate & Environmental Shifts. Skipped online (the big BR map uses the ION
+    // STORM instead). Fog/storms are short, rolling spells (a difficulty spike,
+    // not an oppressive blanket); clear/rain spells last longer.
     s.weatherTimer += delta;
-    if (!onlineRef.current && s.weatherTimer > 30000) { // Slight increase to 30s to let players adapt
+    const weatherSpell =
+      s.weather === WeatherType.Fog || s.weather === WeatherType.Snowstorm || s.weather === WeatherType.Sandstorm
+        ? 12000
+        : 30000;
+    if (!onlineRef.current && s.weatherTimer > weatherSpell) {
       s.weatherTimer = 0;
       
       const weathers = Object.values(WeatherType);
@@ -1873,8 +1899,8 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
           dx: 0.7 + Math.random() * 1.1,
           dy: (Math.random() - 0.5) * 0.3,
           radius: Math.random() * 130 + 120,
-          opacity: 0.13 + Math.random() * 0.05,
-          lifespan: 650,
+          opacity: 0.15 + Math.random() * 0.05,
+          lifespan: 230,
           color: '#cbd5e1',
           type: 'smoke'
         });
@@ -1941,8 +1967,9 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
 
     s.explosions.forEach(exp => { exp.radius += 16; exp.opacity -= exp.fadeSpeed; });
     s.explosions = s.explosions.filter(exp => exp.opacity > 0);
-    // Smoke/fog lingers (slow fade); sparks & debris fade fast as before.
-    s.particles.forEach(p => { p.x += p.dx; p.y += p.dy; p.lifespan--; p.opacity -= p.type === 'smoke' ? 0.0016 : 0.025; });
+    // Smoke/fog drifts a few seconds then clears (rolling bank, not a permanent
+    // blanket); sparks & debris fade fast as before.
+    s.particles.forEach(p => { p.x += p.dx; p.y += p.dy; p.lifespan--; p.opacity -= p.type === 'smoke' ? 0.0011 : 0.025; });
     s.particles = s.particles.filter(p => p.lifespan > 0);
     s.floatingTexts.forEach(t => { t.y -= 2.2; t.opacity -= 0.02; t.lifespan--; });
     s.floatingTexts = s.floatingTexts.filter(t => t.lifespan > 0);
@@ -1993,7 +2020,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
         ultName: ULTIMATES[p0.tankClass].label,
       });
     }
-  }, [onStateUpdate, status, onGameOver, spawnSpecificEnemy, fireBullet, onEnemyKill, initiateReload, createParticles, fireAutoSwarm, requestSpawn, resolveTankCollisions, checkGameOver, damagePlayersRadius, damagePlayersRay, updateStorm, resolveObstacles, destroyCrate]);
+  }, [onStateUpdate, status, onGameOver, spawnSpecificEnemy, fireBullet, onEnemyKill, initiateReload, createParticles, fireAutoSwarm, requestSpawn, resolveTankCollisions, checkGameOver, damagePlayersRadius, damagePlayersRay, updateStorm, resolveObstacles, destroyCrate, damageCratesAlongRay]);
 
   const drawTank = (ctx: CanvasRenderingContext2D, t: Tank) => {
     ctx.save(); ctx.translate(t.x, t.y);
