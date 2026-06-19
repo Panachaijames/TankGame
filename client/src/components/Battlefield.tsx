@@ -1224,7 +1224,13 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
         p.id === localIdRef.current ? sampleLocalInput(s.keys, worldMouseFor(p), p, directRef.current) : remote[p.id] ?? EMPTY_INPUT,
       );
     } else {
-      inputs = sampleLocalInputs(s.keys, s.mouse, s.players, s.players.length, s.enemies, directRef.current);
+      // Aim is computed from the cursor relative to the local tank, so the mouse
+      // must be in WORLD space. On the big follow-camera world (solo FOREST) that
+      // means adding the camera offset; on the small arena worldMouseFor is a
+      // no-op ({0,0} offset). Without this the turret aims at viewport-space
+      // coords vs the world-space tank — bullets fly off and, near spawn, ≈ up.
+      const aimMouse = s.players[0] ? worldMouseFor(s.players[0]) : s.mouse;
+      inputs = sampleLocalInputs(s.keys, aimMouse, s.players, s.players.length, s.enemies, directRef.current);
     }
     // Reload, ammo regen and firing are handled per-player inside the movement loop below.
 
@@ -2523,6 +2529,14 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
     if (s.screenShake > 0.1) ctx.translate((Math.random()-0.5)*s.screenShake, (Math.random()-0.5)*s.screenShake);
     ctx.clearRect(-300, -300, CANVAS_WIDTH + 600, CANVAS_HEIGHT + 600);
 
+    // Follow camera (mirrors PixiRenderer): scroll the world so the local tank
+    // stays centred on the big world. {0,0} on the small arena, so this is a
+    // no-op there. Without it the player renders off-screen on the FOREST map.
+    const camMe = s.player ?? s.players[0];
+    const camTarget = camMe && camMe.health > 0 ? camMe : s.players.find((p) => p.health > 0) ?? camMe;
+    const cam = camTarget ? cameraOffset(camTarget.x, camTarget.y, s.arena.w, s.arena.h) : { x: 0, y: 0 };
+    ctx.translate(-cam.x, -cam.y);
+
     // 1. Fill ground background color dynamically based on TerrainType
     let groundColor = '#0b1329'; // default dark empty grid space
     let gridColor = 'rgba(56, 189, 248, 0.04)';
@@ -2540,13 +2554,16 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
       gridColor = 'rgba(52, 211, 153, 0.06)';
     }
 
+    // Fill / grid over the visible world region (camera-offset viewport).
+    const viewX0 = cam.x, viewY0 = cam.y;
+    const viewX1 = cam.x + CANVAS_WIDTH, viewY1 = cam.y + CANVAS_HEIGHT;
     ctx.fillStyle = groundColor;
-    ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+    ctx.fillRect(viewX0, viewY0, CANVAS_WIDTH, CANVAS_HEIGHT);
 
     // 2. Grid lines
     ctx.strokeStyle = gridColor; ctx.lineWidth = 1;
-    for(let i=0; i<CANVAS_WIDTH; i+=100){ ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, CANVAS_HEIGHT); ctx.stroke(); }
-    for(let j=0; j<CANVAS_HEIGHT; j+=100){ ctx.beginPath(); ctx.moveTo(0, j); ctx.lineTo(CANVAS_WIDTH, j); ctx.stroke(); }
+    for(let i=Math.floor(viewX0/100)*100; i<viewX1; i+=100){ ctx.beginPath(); ctx.moveTo(i, viewY0); ctx.lineTo(i, viewY1); ctx.stroke(); }
+    for(let j=Math.floor(viewY0/100)*100; j<viewY1; j+=100){ ctx.beginPath(); ctx.moveTo(viewX0, j); ctx.lineTo(viewX1, j); ctx.stroke(); }
 
     // 3. Draw physical tire tracks/tread marks
     s.treadMarks.forEach(tm => {
@@ -2585,6 +2602,19 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
 
     s.enemies.forEach(e => drawTank(ctx, e));
     s.players.forEach(p => drawTank(ctx, p));
+
+    // Bush canopies over the tanks (concealment) — forest map only.
+    s.bushes?.forEach((b) => {
+      ctx.save();
+      ctx.globalAlpha = 0.8;
+      ctx.fillStyle = '#06140b';
+      ctx.beginPath(); ctx.ellipse(b.x, b.y + b.r * 0.22, b.r * 0.95, b.r * 0.6, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#247d3f';
+      ctx.beginPath(); ctx.arc(b.x, b.y, b.r * 0.78, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#2f9b4f';
+      ctx.beginPath(); ctx.arc(b.x, b.y, b.r * 0.55, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+    });
 
     s.bullets.forEach(b => {
       ctx.save(); ctx.translate(b.x, b.y); ctx.rotate(b.angle);
@@ -2670,8 +2700,8 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
       }
       
       ctx.fillStyle = grad;
-      ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
-      
+      ctx.fillRect(cam.x, cam.y, CANVAS_WIDTH, CANVAS_HEIGHT);
+
       // Subtle decorative border ring indicating vision thresholds
       ctx.strokeStyle = s.weather === WeatherType.Snowstorm ? 'rgba(255, 255, 255, 0.12)' :
                         (s.weather === WeatherType.Sandstorm ? 'rgba(245, 158, 11, 0.08)' : 'rgba(56, 189, 248, 0.08)');
@@ -2708,7 +2738,7 @@ const Battlefield: React.FC<BattlefieldProps> = ({ onGameOver, onStateUpdate, di
       ctx.fillText(t.text, t.x, t.y); ctx.restore();
     });
 
-    if (s.screenFlash > 0) { ctx.fillStyle = `rgba(255,255,255,${s.screenFlash})`; ctx.fillRect(0,0,CANVAS_WIDTH,CANVAS_HEIGHT); }
+    if (s.screenFlash > 0) { ctx.fillStyle = `rgba(255,255,255,${s.screenFlash})`; ctx.fillRect(cam.x, cam.y, CANVAS_WIDTH, CANVAS_HEIGHT); }
     ctx.restore();
   }, []);
 
